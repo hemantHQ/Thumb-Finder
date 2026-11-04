@@ -1,0 +1,137 @@
+name: Build and publish Thumb Finder
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+      - name: Verify tag matches application version
+        id: version
+        shell: bash
+        run: |
+          APP_VERSION="$(python -c 'from thumb_finder.version import __version__; print(__version__)')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$TAG_VERSION" != "$APP_VERSION" ]; then
+            echo "Tag v$TAG_VERSION does not match thumb_finder/version.py ($APP_VERSION)"
+            exit 1
+          fi
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: macos-latest
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Inject release API configuration
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: python scripts/inject_api_key.py
+
+      - name: Build Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir `
+            --name "Thumb-Finder" `
+            --collect-all cv2 --collect-all PySide6 `
+            --add-data "thumb_finder/app_icon.svg;." `
+            --add-data "thumb_finder/logo.svg;." `
+            run_app.py
+
+      - name: Create Windows installer EXE
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $version = "${{ needs.validate.outputs.app_version }}"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { throw "Inno Setup compiler not found: $iscc" }
+          & $iscc "/DAppVersion=$version" "installer/windows/thumb_finder.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+
+      - name: Build macOS application bundle
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir \
+            --name "Thumb Finder" \
+            --osx-bundle-identifier "com.thumbfinder.app" \
+            --collect-all cv2 --collect-all PySide6 \
+            --add-data "thumb_finder/app_icon.svg:." \
+            --add-data "thumb_finder/logo.svg:." \
+            run_app.py
+
+      - name: Create macOS DMG
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil create \
+            -volname "Thumb Finder" \
+            -srcfolder "dist/Thumb Finder.app" \
+            -ov -format UDZO \
+            "Thumb-Finder-macOS.dmg"
+
+      - name: Upload platform installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Thumb-Finder-${{ matrix.platform }}
+          path: |
+            installer/windows/output/Thumb-Finder-Setup.exe
+            Thumb-Finder-macOS.dmg
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform installers
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum Thumb-Finder-Setup.exe Thumb-Finder-macOS.dmg > SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --title "Thumb Finder v${{ needs.validate.outputs.app_version }}" \
+            --generate-notes
