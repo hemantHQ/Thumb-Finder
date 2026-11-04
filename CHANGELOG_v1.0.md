@@ -13,3 +13,8 @@
 - Similar Thumbnail Image search using local visual comparison against a bounded
   pool of fetched YouTube thumbnails.
 - Long-form duration filtering, auto-loading, and thumbnail downloads.
+
+## Build pipeline update (still v1.0)
+- Build separate native macOS installers for Apple Silicon (ARM64) and Intel (x86_64).
+- Verify each macOS runner architecture before packaging.
+- Publish distinct DMG filenames and include both in SHA-256 checksums.

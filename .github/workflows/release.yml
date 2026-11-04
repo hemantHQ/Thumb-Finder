@@ -49,8 +49,16 @@ jobs:
         include:
           - os: windows-latest
             platform: windows
-          - os: macos-latest
-            platform: macos
+          # Native Apple Silicon build (ARM64)
+          - os: macos-15
+            platform: macos-arm64
+            architecture: arm64
+            dmg_name: Thumb-Finder-macOS-Apple-Silicon.dmg
+          # Native Intel build (x86_64)
+          - os: macos-15-intel
+            platform: macos-intel
+            architecture: x86_64
+            dmg_name: Thumb-Finder-macOS-Intel.dmg
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out selected tag
@@ -100,6 +108,16 @@ jobs:
             throw "Windows installer EXE was not created"
           }
 
+      - name: Verify macOS runner architecture
+        if: runner.os == 'macOS'
+        env:
+          EXPECTED_ARCH: ${{ matrix.architecture }}
+        run: |
+          ACTUAL_ARCH="$(uname -m)"
+          echo "Runner architecture: $ACTUAL_ARCH"
+          echo "Expected architecture: $EXPECTED_ARCH"
+          test "$ACTUAL_ARCH" = "$EXPECTED_ARCH"
+
       - name: Build macOS application bundle
         if: runner.os == 'macOS'
         run: |
@@ -112,21 +130,23 @@ jobs:
             run_app.py
           test -d "dist/Thumb Finder.app"
 
-      - name: Create macOS DMG
+      - name: Create architecture-specific macOS DMG
         if: runner.os == 'macOS'
+        env:
+          DMG_NAME: ${{ matrix.dmg_name }}
         run: |
           hdiutil create \
             -volname "Thumb Finder" \
             -srcfolder "dist/Thumb Finder.app" \
             -ov -format UDZO \
-            "Thumb-Finder-macOS.dmg"
-          test -f "Thumb-Finder-macOS.dmg"
+            "$DMG_NAME"
+          test -f "$DMG_NAME"
 
       - name: Upload platform installer
         uses: actions/upload-artifact@v4
         with:
           name: Thumb-Finder-${{ matrix.platform }}
-          path: ${{ matrix.platform == 'windows' && 'installer/windows/output/Thumb-Finder-Setup.exe' || 'Thumb-Finder-macOS.dmg' }}
+          path: ${{ matrix.platform == 'windows' && 'installer/windows/output/Thumb-Finder-Setup.exe' || matrix.dmg_name }}
           if-no-files-found: error
           compression-level: 0
 
@@ -144,7 +164,7 @@ jobs:
         shell: bash
         run: |
           cd release-assets
-          sha256sum Thumb-Finder-Setup.exe Thumb-Finder-macOS.dmg > SHA256SUMS.txt
+          sha256sum Thumb-Finder-Setup.exe Thumb-Finder-macOS-Apple-Silicon.dmg Thumb-Finder-macOS-Intel.dmg > SHA256SUMS.txt
 
       - name: Publish or update GitHub Release
         env:
