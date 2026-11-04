@@ -1,4 +1,4 @@
-import os, sys, json, requests
+import os, sys, json, requests, logging, traceback, re
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote
@@ -45,6 +45,51 @@ def load_youtube_api_key():
             except ImportError:
                 YOUTUBE_API_KEY = ""
     return (YOUTUBE_API_KEY or os.environ.get("THUMB_FINDER_YOUTUBE_API_KEY", "")).strip()
+
+
+def load_github_repository():
+    """Return owner/repository used by the startup update checker."""
+    configured = ""
+    try:
+        from .api_config import GITHUB_REPOSITORY
+        configured = GITHUB_REPOSITORY
+    except ImportError:
+        configured = ""
+    return (configured or os.environ.get("THUMB_FINDER_GITHUB_REPOSITORY", "")).strip()
+
+
+def configure_logging():
+    """Write diagnostic logs to the user's profile, never to the install folder."""
+    log_dir = Path.home() / ".thumb_finder" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        filename=str(log_dir / "thumb_finder.log"),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        encoding="utf-8",
+    )
+    return log_dir / "thumb_finder.log"
+
+
+def handle_unhandled_exception(exc_type, exc_value, exc_tb):
+    """Log unexpected crashes and show a useful message instead of failing silently."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logging.critical(
+        "Unhandled application exception",
+        exc_info=(exc_type, exc_value, exc_tb),
+    )
+    app = QApplication.instance()
+    if app is not None:
+        QMessageBox.critical(
+            None,
+            "Thumb Finder encountered an error",
+            "An unexpected error occurred. The application has saved diagnostic "
+            "details to its log file.\n\n"
+            f"Error: {exc_value}\n\n"
+            f"Log file: {Path.home() / '.thumb_finder' / 'logs' / 'thumb_finder.log'}",
+        )
 
 CONFIG_PATH = Path.home() / ".thumb_finder" / "config.json"
 DOWNLOAD_ROOT = Path.home() / "Pictures" / "Thumb Finder"
@@ -315,6 +360,68 @@ class ImageWorker(QRunnable):
             r=requests.get(self.url,timeout=12); r.raise_for_status(); self.signals.done.emit(r.content)
         except Exception: self.signals.done.emit(b"")
 
+class UpdateSignals(QObject):
+    finished = Signal(object, object)
+
+
+def version_tuple(value):
+    """Convert a simple semantic version to comparable integer components."""
+    numbers = [int(part) for part in re.findall(r"\d+", str(value or ""))[:4]]
+    numbers += [0] * (4 - len(numbers))
+    return tuple(numbers)
+
+
+class UpdateCheckWorker(QRunnable):
+    """Check the public GitHub Releases API without blocking the UI thread."""
+    def __init__(self, repository, current_version):
+        super().__init__()
+        self.repository = repository
+        self.current_version = current_version
+        self.signals = UpdateSignals()
+
+    def run(self):
+        try:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository or ""):
+                self.signals.finished.emit(None, "Update source is not configured for this build.")
+                return
+
+            url = f"https://api.github.com/repos/{self.repository}/releases/latest"
+            response = requests.get(
+                url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "Thumb-Finder-Update-Checker",
+                },
+                timeout=(4, 8),
+            )
+            if response.status_code == 404:
+                self.signals.finished.emit({"available": False, "no_release": True}, None)
+                return
+            response.raise_for_status()
+            release = response.json()
+            if release.get("draft") or release.get("prerelease"):
+                self.signals.finished.emit({"available": False}, None)
+                return
+
+            tag = str(release.get("tag_name", "")).strip()
+            latest = tag[1:] if tag.lower().startswith("v") else tag
+            if not latest:
+                raise ValueError("The latest GitHub release does not contain a version tag.")
+
+            available = version_tuple(latest) > version_tuple(self.current_version)
+            result = {
+                "available": available,
+                "latest_version": latest,
+                "current_version": self.current_version,
+                "release_url": release.get("html_url", ""),
+                "release_notes": release.get("body", ""),
+            }
+            self.signals.finished.emit(result, None)
+        except Exception as exc:
+            logging.warning("Update check failed: %s", exc, exc_info=True)
+            self.signals.finished.emit(None, str(exc))
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent, download_dir):
         super().__init__(parent)
@@ -451,17 +558,83 @@ class MainWindow(QMainWindow):
         self.apply_theme()
 
     def run_first_launch_setup(self):
-        self.download_dir.mkdir(parents=True, exist_ok=True)
-        self.config.setdefault("setup_complete", True)
-        self.config.setdefault("download_dir", str(self.download_dir))
-        save_config(self.config)
+        try:
+            self.download_dir.mkdir(parents=True, exist_ok=True)
+            self.config.setdefault("setup_complete", True)
+            self.config.setdefault("download_dir", str(self.download_dir))
+            save_config(self.config)
+        except Exception as exc:
+            logging.exception("First-launch setup failed")
+            QMessageBox.critical(
+                self, "Setup error",
+                f"Thumb Finder could not prepare its user folders.\n\n{exc}"
+            )
+            return False
+
         if not self.api_key:
+            logging.error("YouTube API configuration is missing from this build.")
             QMessageBox.critical(
                 self, "Configuration unavailable",
-                "This build has no YouTube API configuration. Please download an official release."
+                "This copy does not contain the publisher's YouTube API configuration. "
+                "Please download the official release from GitHub."
             )
             return False
         return True
+
+    def start_startup_update_check(self, splash):
+        self.status.setText("Checking for updates…")
+        if not self.github_repository:
+            logging.info("Update check skipped: GitHub repository is not configured.")
+            self.show_after_startup_check(splash, None, "Update checking is not configured.")
+            return
+        worker = UpdateCheckWorker(self.github_repository, APP_VERSION)
+        self.update_worker = worker
+        worker.signals.finished.connect(
+            lambda result, error: self.show_after_startup_check(splash, result, error)
+        )
+        self.pool.start(worker)
+
+    def show_after_startup_check(self, splash, result, error):
+        try:
+            self.show()
+            splash.finish(self)
+        except Exception:
+            logging.exception("Could not complete startup display transition")
+
+        if error:
+            self.status.setText("Couldn't check for updates. You can still use Thumb Finder.")
+            logging.warning("Startup update check did not complete: %s", error)
+            return
+
+        if result and result.get("available"):
+            QTimer.singleShot(250, lambda: self.show_update_dialog(result))
+        elif result and result.get("no_release"):
+            self.status.setText("Ready. No public release is available for update checking yet.")
+        else:
+            self.status.setText("You're using the latest version of Thumb Finder.")
+
+    def show_update_dialog(self, release):
+        latest = release.get("latest_version", "new version")
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setWindowTitle("Update available")
+        dialog.setText(f"A new version of Thumb Finder is available: v{latest}")
+        dialog.setInformativeText(
+            f"Installed version: v{APP_VERSION}\n"
+            "Download the latest release to get the newest features and fixes."
+        )
+        download_button = dialog.addButton("Download update", QMessageBox.AcceptRole)
+        dialog.addButton("Later", QMessageBox.RejectRole)
+        dialog.exec()
+        if dialog.clickedButton() == download_button:
+            release_url = release.get("release_url", "")
+            if release_url:
+                QDesktopServices.openUrl(QUrl(release_url))
+            else:
+                QMessageBox.warning(
+                    self, "Update link unavailable",
+                    "The release was found, but GitHub did not provide a download page URL."
+                )
 
     def build_ui(self):
         central = QWidget()
@@ -650,6 +823,11 @@ class MainWindow(QMainWindow):
         auto_hint = QLabel("AUTO-LOAD ON SCROLL")
         auto_hint.setObjectName("Eyebrow")
         footer.addWidget(auto_hint)
+        footer.addSpacing(18)
+        signature = QLabel("Thumb Finder v1.0 - Hemant")
+        signature.setObjectName("Muted")
+        signature.setStyleSheet("font-size:8.5pt;font-weight:700;background:transparent;")
+        footer.addWidget(signature)
         content.addLayout(footer)
         body.addLayout(content, 1)
         root.addLayout(body, 1)
@@ -902,20 +1080,45 @@ def make_splash():
     painter.setPen(QColor("white")); painter.setFont(QFont("Segoe UI",34,QFont.Bold)); painter.drawText(218,110,84,45,Qt.AlignCenter,"✦")
     painter.setFont(QFont("Segoe UI",25,QFont.Bold)); painter.drawText(0,178,520,42,Qt.AlignCenter,"Thumb Finder")
     painter.setPen(QColor("#b8bdd0")); painter.setFont(QFont("Segoe UI",10)); painter.drawText(0,214,520,28,Qt.AlignCenter,"Discover. Explore. Get Inspired.")
-    painter.setPen(QColor("#8b80ff")); painter.drawText(0,264,520,20,Qt.AlignCenter,"Preparing your workspace…")
+    painter.setPen(QColor("#8b80ff")); painter.drawText(0,264,520,20,Qt.AlignCenter,"Loading Thumb Finder  ·  Checking for updates…")
     painter.end(); return pix
 
 def main():
-    app=QApplication(sys.argv); app.setApplicationName(APP_NAME)
-    icon_path=Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "app_icon.svg"
-    if icon_path.exists(): app.setWindowIcon(QIcon(str(icon_path)))
-    splash=QSplashScreen(make_splash()); splash.show(); app.processEvents()
-    window=MainWindow()
-    if not window.run_first_launch_setup():
+    try:
+        log_path = configure_logging()
+    except Exception:
+        log_path = Path.home() / "thumb_finder_startup.log"
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    sys.excepthook = handle_unhandled_exception
+
+    icon_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "app_icon.svg"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
+
+    splash = QSplashScreen(make_splash())
+    splash.show()
+    app.processEvents()
+
+    try:
+        window = MainWindow()
+        if not window.run_first_launch_setup():
+            splash.close()
+            return 1
+        QTimer.singleShot(0, lambda: window.start_startup_update_check(splash))
+        return app.exec()
+    except Exception as exc:
+        logging.exception("Fatal startup error")
         splash.close()
-        return
-    QTimer.singleShot(500, lambda:(window.show(),splash.finish(window)))
-    sys.exit(app.exec())
+        QMessageBox.critical(
+            None,
+            "Thumb Finder could not start",
+            f"The application encountered a startup error.\n\n{exc}\n\n"
+            f"Diagnostic log: {log_path}",
+        )
+        return 1
 
 if __name__ == "__main__":
     main()

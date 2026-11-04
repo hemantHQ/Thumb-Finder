@@ -1,6 +1,6 @@
 #define MyAppName "Thumb Finder"
 #ifndef AppVersion
-  #define AppVersion "0.10.0"
+  #define AppVersion "1.0.0"
 #endif
 #define MyAppPublisher "Thumb Finder"
 #define MyAppExeName "Thumb-Finder.exe"
@@ -10,6 +10,7 @@ AppId={{A2A6B4B1-7C6E-4D0B-9D9A-123456789001}
 AppName={#MyAppName}
 AppVersion={#AppVersion}
 AppPublisher={#MyAppPublisher}
+AppComments=Standalone desktop application with bundled Python runtime and dependencies.
 DefaultDirName={autopf}\Thumb Finder
 DefaultGroupName=Thumb Finder
 DisableProgramGroupPage=yes

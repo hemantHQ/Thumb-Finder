@@ -3,21 +3,24 @@
 **Discover. Explore. Get Inspired.**
 
 Thumb Finder is a PySide6 desktop application for discovering and saving YouTube
-video thumbnails. Current project milestone: **v0.10.0**.
+video thumbnails. Current project milestone: **v1.0**.
 
 ## API key setup for users
 
-Users do not enter a YouTube API key. The publisher adds a GitHub Actions repository
-secret named `YOUTUBE_API_KEY`; tagged release builds inject it into the app.
+Users do not install Python or separate packages. The Windows installer and macOS app
+bundle the Python runtime and required libraries. Users do not enter a YouTube API key.
+The publisher adds a GitHub Actions repository secret named `YOUTUBE_API_KEY`; release
+builds inject it into the app.
 
 **Security warning:** the key is embedded in the public EXE/APP and can be extracted.
 GitHub Secrets do not make a client-embedded key private. See `docs/SECURITY.md`.
 
 ## Build and release
 
-Push a version tag such as `v0.10.0` to trigger `.github/workflows/release.yml`.
-GitHub Actions builds Windows and macOS artifacts on native runners and publishes
-a GitHub Release.
+Push a matching version tag such as `v1.0.0` to trigger `.github/workflows/release.yml`.
+GitHub Actions builds a Windows `Thumb-Finder-Setup.exe` and macOS
+`Thumb-Finder-macOS.dmg`. You can also manually rerun the workflow for an
+existing tag from the Actions tab.
 
 Required repository secret: `YOUTUBE_API_KEY`.
 
@@ -48,3 +51,13 @@ Never commit a real key.
 - Mandatory update client and signed update manifest.
 - Windows/macOS code signing and macOS notarization.
 - Public beta testing and release hardening.
+
+
+## Startup behavior and diagnostics
+
+On launch, Thumb Finder shows a loading screen while it checks the configured
+GitHub repository for a newer public release. If an update is found, the app
+offers to open the release page. A network or GitHub error does not block app
+startup. Diagnostic logs are written to `~/.thumb_finder/logs/thumb_finder.log`.
+
+The footer displays `Thumb Finder v1.0 - Hemant`.
