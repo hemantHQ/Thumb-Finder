@@ -49,11 +49,6 @@ jobs:
         include:
           - os: windows-latest
             platform: windows
-          # Native Apple Silicon build (ARM64)
-          - os: macos-15
-            platform: macos-arm64
-            architecture: arm64
-            dmg_name: Thumb-Finder-macOS-Apple-Silicon.dmg
           # Native Intel build (x86_64)
           - os: macos-15-intel
             platform: macos-intel
@@ -164,7 +159,7 @@ jobs:
         shell: bash
         run: |
           cd release-assets
-          sha256sum Thumb-Finder-Setup.exe Thumb-Finder-macOS-Apple-Silicon.dmg Thumb-Finder-macOS-Intel.dmg > SHA256SUMS.txt
+          sha256sum Thumb-Finder-Setup.exe Thumb-Finder-macOS-Intel.dmg > SHA256SUMS.txt
 
       - name: Publish or update GitHub Release
         env:

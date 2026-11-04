@@ -15,6 +15,7 @@
 - Long-form duration filtering, auto-loading, and thumbnail downloads.
 
 ## Build pipeline update (still v1.0)
-- Build separate native macOS installers for Apple Silicon (ARM64) and Intel (x86_64).
-- Verify each macOS runner architecture before packaging.
-- Publish distinct DMG filenames and include both in SHA-256 checksums.
+- Build a native macOS Intel (x86_64) installer alongside the Windows installer.
+- Verify the macOS Intel runner architecture before packaging.
+- Apple Silicon (ARM64) build is currently disabled; it can be re-enabled later.
+- Publish the Intel DMG and include it with the Windows installer in SHA-256 checksums.

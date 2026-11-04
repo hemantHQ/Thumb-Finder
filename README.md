@@ -18,9 +18,9 @@ GitHub Secrets do not make a client-embedded key private. See `docs/SECURITY.md`
 ## Build and release
 
 Push a matching version tag such as `v1.0.0` to trigger `.github/workflows/release.yml`.
-GitHub Actions builds a Windows `Thumb-Finder-Setup.exe` plus two native macOS
-installers: `Thumb-Finder-macOS-Apple-Silicon.dmg` (ARM64) and
-`Thumb-Finder-macOS-Intel.dmg` (x86_64). You can also manually rerun the workflow
+GitHub Actions builds a Windows `Thumb-Finder-Setup.exe` plus one native macOS
+installer: `Thumb-Finder-macOS-Intel.dmg` (x86_64). Apple Silicon builds are
+currently disabled. You can also manually rerun the workflow
 for an existing tag from the Actions tab.
 
 Required repository secret: `YOUTUBE_API_KEY`.

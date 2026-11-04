@@ -7,7 +7,7 @@
    `git tag v1.0.0` then `git push origin v1.0.0`.
 5. GitHub Actions validates the tag and builds:
    - Windows: `Thumb-Finder-Setup.exe` using Inno Setup.
-   - macOS: `Thumb-Finder-macOS-Apple-Silicon.dmg and Thumb-Finder-macOS-Intel.dmg` containing the `.app`.
+   - macOS Intel (x86_64): `Thumb-Finder-macOS-Intel.dmg` containing the `.app`.
 6. The workflow publishes both installers and `SHA256SUMS.txt` to the matching GitHub Release.
 
 ## Re-run a build for an existing tag
@@ -20,8 +20,8 @@ If the tag/release already exists and the workflow did not run:
 4. Enter the existing tag, for example `v1.0.0`.
 5. Click **Run workflow**.
 
-The manual run checks out that tag, verifies its version, builds both installers,
-and uploads/replaces the assets on the existing release.
+The manual run checks out that tag, verifies its version, builds the Windows and
+macOS Intel installers, and uploads/replaces the assets on the existing release.
 
 ## Required repository configuration
 
