@@ -19,3 +19,16 @@
 - Verify the macOS Intel runner architecture before packaging.
 - Apple Silicon (ARM64) build is currently disabled; it can be re-enabled later.
 - Publish the Intel DMG and include it with the Windows installer in SHA-256 checksums.
+### Startup hotfix (v1.0)
+- Fixed startup crash caused by the GitHub repository setting not being initialized before the update check.
+
+
+## Maintenance build improvements (displayed version remains v1.0)
+
+- Added branded Windows ICO and macOS ICNS application icons.
+- Added portable Windows ZIP and Intel macOS app/DMG packages.
+- Reduced packaging scope by excluding unused optional Qt and scientific modules.
+- Added startup release checks against hemantHQ/Thumb-Finder.
+- Added platform-aware update downloads, SHA-256 verification, restart confirmation, and helper-based app replacement.
+- Improved diagnostic logging and update failure handling.
+- Added internal build revisions so updates can be delivered without changing the visible v1.0 version.

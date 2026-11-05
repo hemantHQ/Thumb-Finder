@@ -1,10 +1,11 @@
-import os, sys, json, requests, logging, traceback, re
+import os, sys, json, requests, logging, traceback, re, hashlib, tempfile
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote
 from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QUrl, QSize, QTimer
 from PySide6.QtGui import QPixmap, QDesktopServices, QFont, QIcon, QPainter, QColor
 from PySide6.QtWidgets import QSplashScreen
+from .updater import launch_update_helper, platform_key
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QComboBox, QSpinBox, QFrame, QScrollArea,
@@ -32,6 +33,19 @@ except ImportError:
 APP_NAME = "Thumb Finder"
 APP_VERSION = __version__
 
+
+def load_build_number():
+    try:
+        from .api_config import BUILD_NUMBER
+        return int(BUILD_NUMBER)
+    except Exception:
+        try:
+            return int(os.environ.get("THUMB_FINDER_BUILD_NUMBER", "0"))
+        except (TypeError, ValueError):
+            return 0
+
+APP_BUILD = load_build_number()
+
 def load_youtube_api_key():
     """Load CI-injected key, or environment variable for local development."""
     try:
@@ -55,7 +69,7 @@ def load_github_repository():
         configured = GITHUB_REPOSITORY
     except ImportError:
         configured = ""
-    return (configured or os.environ.get("THUMB_FINDER_GITHUB_REPOSITORY", "")).strip()
+    return (configured or os.environ.get("THUMB_FINDER_GITHUB_REPOSITORY", "hemantHQ/Thumb-Finder")).strip()
 
 
 def configure_logging():
@@ -172,13 +186,28 @@ QDialogButtonBox QPushButton { min-width:95px; }
 
 def load_config():
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not CONFIG_PATH.exists():
+            return {}
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception:
+        logging.exception("Could not read settings file; using safe defaults")
         return {}
 
 def save_config(data):
+    """Write settings atomically so an interrupted save cannot corrupt config."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    temporary = CONFIG_PATH.with_suffix(".json.tmp")
+    try:
+        temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(temporary, CONFIG_PATH)
+    except Exception:
+        logging.exception("Could not save application settings")
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 class WorkerSignals(QObject):
     finished = Signal(object, object)
@@ -358,7 +387,9 @@ class ImageWorker(QRunnable):
     def run(self):
         try:
             r=requests.get(self.url,timeout=12); r.raise_for_status(); self.signals.done.emit(r.content)
-        except Exception: self.signals.done.emit(b"")
+        except Exception:
+            logging.exception("Thumbnail preview download failed: %s", self.url)
+            self.signals.done.emit(b"")
 
 class UpdateSignals(QObject):
     finished = Signal(object, object)
@@ -372,28 +403,22 @@ def version_tuple(value):
 
 
 class UpdateCheckWorker(QRunnable):
-    """Check the public GitHub Releases API without blocking the UI thread."""
-    def __init__(self, repository, current_version):
+    """Check the latest public release and its build manifest."""
+    def __init__(self, repository, current_version, current_build, platform):
         super().__init__()
         self.repository = repository
         self.current_version = current_version
+        self.current_build = current_build
+        self.platform = platform
         self.signals = UpdateSignals()
 
     def run(self):
         try:
             if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository or ""):
-                self.signals.finished.emit(None, "Update source is not configured for this build.")
-                return
-
+                raise ValueError("Update source is not configured for this build.")
+            headers = {"Accept": "application/vnd.github+json", "User-Agent": "Thumb-Finder-Updater"}
             url = f"https://api.github.com/repos/{self.repository}/releases/latest"
-            response = requests.get(
-                url,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": "Thumb-Finder-Update-Checker",
-                },
-                timeout=(4, 8),
-            )
+            response = requests.get(url, headers=headers, timeout=(5, 12))
             if response.status_code == 404:
                 self.signals.finished.emit({"available": False, "no_release": True}, None)
                 return
@@ -402,23 +427,78 @@ class UpdateCheckWorker(QRunnable):
             if release.get("draft") or release.get("prerelease"):
                 self.signals.finished.emit({"available": False}, None)
                 return
-
             tag = str(release.get("tag_name", "")).strip()
             latest = tag[1:] if tag.lower().startswith("v") else tag
             if not latest:
-                raise ValueError("The latest GitHub release does not contain a version tag.")
-
-            available = version_tuple(latest) > version_tuple(self.current_version)
+                raise ValueError("The latest GitHub release has no version tag.")
+            assets = {a.get("name"): a for a in release.get("assets", [])}
+            manifest_asset = assets.get("thumb-finder-update.json")
+            if not manifest_asset:
+                # Older releases can still be opened manually; they are not silently installed.
+                self.signals.finished.emit({
+                    "available": version_tuple(latest) > version_tuple(self.current_version),
+                    "manual_only": True, "latest_version": latest,
+                    "release_url": release.get("html_url", "")}, None)
+                return
+            manifest_response = requests.get(manifest_asset["browser_download_url"], headers=headers, timeout=(5, 12))
+            manifest_response.raise_for_status()
+            manifest = manifest_response.json()
+            if str(manifest.get("version", "")) != latest:
+                raise ValueError("The update manifest version does not match the GitHub release tag.")
+            remote_build = int(manifest.get("build", 0))
+            newer = (version_tuple(latest) > version_tuple(self.current_version) or
+                     (version_tuple(latest) == version_tuple(self.current_version) and remote_build > self.current_build))
+            asset_name = manifest.get("assets", {}).get(self.platform)
+            if asset_name and Path(str(asset_name)).name != str(asset_name):
+                raise ValueError("The update manifest contains an invalid package filename.")
+            asset = assets.get(asset_name) if asset_name else None
+            checksum = manifest.get("sha256", {}).get(self.platform, "")
+            if newer and (not asset or not checksum):
+                raise ValueError(f"The release is missing the {self.platform} update package or checksum.")
             result = {
-                "available": available,
-                "latest_version": latest,
-                "current_version": self.current_version,
-                "release_url": release.get("html_url", ""),
+                "available": newer, "latest_version": latest, "latest_build": remote_build,
+                "current_build": self.current_build, "release_url": release.get("html_url", ""),
                 "release_notes": release.get("body", ""),
+                "asset_url": asset.get("browser_download_url", "") if asset else "",
+                "asset_name": asset_name or "", "sha256": checksum,
             }
             self.signals.finished.emit(result, None)
         except Exception as exc:
             logging.warning("Update check failed: %s", exc, exc_info=True)
+            self.signals.finished.emit(None, str(exc))
+
+
+class UpdateDownloadWorker(QRunnable):
+    """Download a platform package and verify its SHA-256 before staging."""
+    def __init__(self, url, filename, expected_sha256):
+        super().__init__()
+        self.url, self.filename, self.expected_sha256 = url, filename, expected_sha256
+        self.signals = UpdateSignals()
+
+    def run(self):
+        try:
+            if Path(self.filename).name != self.filename or not self.filename.lower().endswith(".zip"):
+                raise ValueError("The update package filename is invalid.")
+            if not self.url.startswith("https://"):
+                raise ValueError("The update package URL must use HTTPS.")
+            response = requests.get(self.url, stream=True, timeout=(10, 90),
+                                    headers={"User-Agent": "Thumb-Finder-Updater"})
+            response.raise_for_status()
+            cache = Path.home() / ".thumb_finder" / "updates"
+            cache.mkdir(parents=True, exist_ok=True)
+            target = cache / self.filename
+            digest = hashlib.sha256()
+            with target.open("wb") as output:
+                for chunk in response.iter_content(1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+                        digest.update(chunk)
+            if digest.hexdigest().lower() != self.expected_sha256.lower():
+                target.unlink(missing_ok=True)
+                raise ValueError("Update verification failed. The downloaded file did not match its SHA-256 checksum.")
+            self.signals.finished.emit({"path": str(target)}, None)
+        except Exception as exc:
+            logging.exception("Update download failed")
             self.signals.finished.emit(None, str(exc))
 
 
@@ -533,6 +613,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = load_config()
         self.api_key = load_youtube_api_key()
+        self.github_repository = load_github_repository()
         self.download_dir = Path(self.config.get(
             "download_dir", str(DOWNLOAD_ROOT))).expanduser()
         self.dark = self.config.get("dark", True)
@@ -550,8 +631,13 @@ class MainWindow(QMainWindow):
         self.download_workers = []
         self._visible_cards = []
         self.setWindowTitle("Thumb Finder")
-        icon_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "app_icon.svg"
-        if icon_path.exists(): self.setWindowIcon(QIcon(str(icon_path)))
+        resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+        icon_path = resource_root / ("app_icon.ico" if sys.platform == "win32" else "app_icon.icns")
+        if not icon_path.exists():
+            icon_path = resource_root / "app_icon.svg"
+        self.app_icon_path = icon_path if icon_path.exists() else None
+        if self.app_icon_path:
+            self.setWindowIcon(QIcon(str(self.app_icon_path)))
         self.setMinimumSize(1050,700)
         self.resize(1250,820)
         self.build_ui()
@@ -587,7 +673,7 @@ class MainWindow(QMainWindow):
             logging.info("Update check skipped: GitHub repository is not configured.")
             self.show_after_startup_check(splash, None, "Update checking is not configured.")
             return
-        worker = UpdateCheckWorker(self.github_repository, APP_VERSION)
+        worker = UpdateCheckWorker(self.github_repository, APP_VERSION, APP_BUILD, platform_key())
         self.update_worker = worker
         worker.signals.finished.connect(
             lambda result, error: self.show_after_startup_check(splash, result, error)
@@ -618,23 +704,52 @@ class MainWindow(QMainWindow):
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Information)
         dialog.setWindowTitle("Update available")
-        dialog.setText(f"A new version of Thumb Finder is available: v{latest}")
+        dialog.setText(f"Thumb Finder v{latest} is available.")
         dialog.setInformativeText(
-            f"Installed version: v{APP_VERSION}\n"
-            "Download the latest release to get the newest features and fixes."
+            f"Installed version: v{APP_VERSION} (build {APP_BUILD})\n"
+            f"New build: {release.get('latest_build', 'latest')}\n\n"
+            "The update will be downloaded and verified before the current app is replaced."
         )
-        download_button = dialog.addButton("Download update", QMessageBox.AcceptRole)
-        dialog.addButton("Later", QMessageBox.RejectRole)
+        update_button = dialog.addButton("Download & update", QMessageBox.AcceptRole)
+        later_button = dialog.addButton("Later", QMessageBox.RejectRole)
         dialog.exec()
-        if dialog.clickedButton() == download_button:
-            release_url = release.get("release_url", "")
-            if release_url:
-                QDesktopServices.openUrl(QUrl(release_url))
-            else:
-                QMessageBox.warning(
-                    self, "Update link unavailable",
-                    "The release was found, but GitHub did not provide a download page URL."
-                )
+        if dialog.clickedButton() == update_button:
+            if release.get("manual_only"):
+                QDesktopServices.openUrl(QUrl(release.get("release_url", "https://github.com/hemantHQ/Thumb-Finder/releases/latest")))
+                return
+            self.begin_update_download(release)
+
+    def begin_update_download(self, release):
+        self.status.setText("Downloading update securely…")
+        self.progress.show()
+        worker = UpdateDownloadWorker(release["asset_url"], release["asset_name"], release["sha256"])
+        self.update_download_worker = worker
+        worker.signals.finished.connect(self.on_update_downloaded)
+        self.pool.start(worker)
+
+    def on_update_downloaded(self, result, error):
+        self.progress.hide()
+        if error or not result:
+            logging.error("Update could not be downloaded: %s", error)
+            QMessageBox.warning(self, "Update failed", f"Thumb Finder could not install the update.\n\n{error}")
+            self.status.setText("Update failed. You can continue using the current version.")
+            return
+        archive = Path(result["path"])
+        choice = QMessageBox.question(
+            self, "Update ready",
+            "The update has been downloaded and verified.\n\nRestart Thumb Finder now to replace the old version?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if choice != QMessageBox.Yes:
+            self.status.setText("Update downloaded. You can install it next time from the update prompt.")
+            return
+        try:
+            launch_update_helper(archive, os.getpid())
+            logging.info("Launching updater helper for %s", archive)
+            QApplication.quit()
+        except Exception as exc:
+            logging.exception("Could not start update helper")
+            QMessageBox.critical(self, "Update could not start", f"The update is ready but could not replace the app.\n\n{exc}\n\nYou can download it manually from the GitHub release page.")
+            QDesktopServices.openUrl(QUrl("https://github.com/hemantHQ/Thumb-Finder/releases/latest"))
 
     def build_ui(self):
         central = QWidget()
@@ -646,10 +761,14 @@ class MainWindow(QMainWindow):
         # Header / brand bar
         header = QHBoxLayout()
         header.setSpacing(13)
-        logo = QLabel("✦")
+        logo = QLabel()
         logo.setFixedSize(48, 48)
         logo.setAlignment(Qt.AlignCenter)
-        logo.setStyleSheet("background:#6657e8;color:white;border-radius:15px;font-size:24pt;font-weight:800;")
+        if self.app_icon_path:
+            logo.setPixmap(QIcon(str(self.app_icon_path)).pixmap(QSize(48, 48)))
+        else:
+            logo.setText("✦")
+            logo.setStyleSheet("background:#6657e8;color:white;border-radius:15px;font-size:24pt;font-weight:800;")
         header.addWidget(logo)
         brand = QVBoxLayout()
         brand.setSpacing(0)
@@ -1094,7 +1213,10 @@ def main():
     app.setApplicationVersion(APP_VERSION)
     sys.excepthook = handle_unhandled_exception
 
-    icon_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "app_icon.svg"
+    resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    icon_path = resource_root / ("app_icon.ico" if sys.platform == "win32" else "app_icon.icns")
+    if not icon_path.exists():
+        icon_path = resource_root / "app_icon.svg"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 

@@ -17,6 +17,7 @@ htmlcov/
 
 # Build outputs
 build/
+build_icons/
 dist/
 *.spec
 *.egg-info/
@@ -36,3 +37,7 @@ output/
 
 # Generated release configuration (never commit real credentials)
 thumb_finder/api_config.py
+
+# Generated platform icons and injected release config
+thumb_finder/app_icon.ico
+thumb_finder/app_icon.icns

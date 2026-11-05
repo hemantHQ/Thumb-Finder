@@ -2,31 +2,34 @@
 
 **Discover. Explore. Get Inspired.**
 
-Thumb Finder is a PySide6 desktop application for discovering and saving YouTube
-video thumbnails. Current project milestone: **v1.0**.
+Thumb Finder is a portable PySide6 desktop application for discovering and saving YouTube video thumbnails. The displayed product version remains **v1.0**; an internal build number allows maintenance updates without changing the displayed version.
 
-## API key setup for users
+## Portable downloads
 
-Users do not install Python or separate packages. The Windows installer and macOS app
-bundle the Python runtime and required libraries. Users do not enter a YouTube API key.
-The publisher adds a GitHub Actions repository secret named `YOUTUBE_API_KEY`; release
-builds inject it into the app.
+- **Windows:** download `Thumb-Finder-Windows-Portable.zip`, extract the folder, and run `Thumb-Finder.exe`. No installer or Python installation is required. Keep the extracted folder in a location your Windows account can modify so automatic updates can replace its files.
+- **Intel macOS:** open `Thumb-Finder-macOS-Intel.dmg` and copy `Thumb Finder.app` to a user-writable Applications folder (for example `~/Applications`). The portable app bundle contains its runtime; Python is not required. The matching portable ZIP is used by the in-app updater.
 
-**Security warning:** the key is embedded in the public EXE/APP and can be extracted.
-GitHub Secrets do not make a client-embedded key private. See `docs/SECURITY.md`.
+The app is currently built for Windows x64 and Intel macOS (x86_64). Apple Silicon native builds are disabled for now.
+
+## Automatic updates
+
+At startup, the app checks the latest public release from `https://github.com/hemantHQ/Thumb-Finder`. If a compatible update is available, choose **Download & update**. The app downloads the correct platform package, verifies its SHA-256 checksum, and asks whether to restart. On confirmation, a separate helper waits for the app to close, replaces the old portable app files, and launches the updated app. If the network is unavailable, the current app continues to start normally.
+
+For reliable automatic replacement, keep the portable app in a folder/bundle location writable by your user account. If the app is inside a protected system folder, update replacement may require manual installation from the GitHub release page.
+
+The update manifest uses an internal build number. The visible version remains **v1.0** until the publisher explicitly changes it.
+
+## API key setup
+
+Users do not enter a YouTube API key. The publisher adds a GitHub Actions repository secret named `YOUTUBE_API_KEY`; release builds inject it into the client application.
+
+**Security warning:** a key embedded in a public desktop application can be extracted. GitHub Secrets protect it during CI, not after distribution. Restrict the key to the YouTube Data API, monitor quota, and rotate it if abused. See `docs/SECURITY.md`.
 
 ## Build and release
 
-Push a matching version tag such as `v1.0.0` to trigger `.github/workflows/release.yml`.
-GitHub Actions builds a Windows `Thumb-Finder-Setup.exe` plus one native macOS
-installer: `Thumb-Finder-macOS-Intel.dmg` (x86_64). Apple Silicon builds are
-currently disabled. You can also manually rerun the workflow
-for an existing tag from the Actions tab.
+Push a matching tag such as `v1.0.0`, or manually run the GitHub Actions workflow for that tag. The workflow builds Windows x64 and Intel macOS packages, generates checksums and an update manifest, and publishes them to the GitHub Release.
 
 Required repository secret: `YOUTUBE_API_KEY`.
-
-Protect the default branch and release tags. Review workflow changes carefully:
-the release job has access to the API secret.
 
 ## Local developer run (Windows)
 
@@ -43,22 +46,10 @@ Never commit a real key.
 ## Current feature baseline
 
 - Actor Name and Topic Search.
-- Similar Thumbnail Image search using local visual comparison against a bounded
-  pool of fetched YouTube thumbnails; not internet-wide reverse-image search.
-- Long-form duration filtering, auto-loading, and thumbnail downloads.
+- Similar Thumbnail Image search using local visual comparison against a bounded pool of fetched YouTube thumbnails; not internet-wide reverse-image search.
+- Long-form duration filtering, automatic gallery loading, and thumbnail downloads.
+- Startup update checks, checksum verification, portable self-update, and diagnostic logging.
 
-## Planned work
-
-- Mandatory update client and signed update manifest.
-- Windows/macOS code signing and macOS notarization.
-- Public beta testing and release hardening.
-
-
-## Startup behavior and diagnostics
-
-On launch, Thumb Finder shows a loading screen while it checks the configured
-GitHub repository for a newer public release. If an update is found, the app
-offers to open the release page. A network or GitHub error does not block app
-startup. Diagnostic logs are written to `~/.thumb_finder/logs/thumb_finder.log`.
+Diagnostic logs are written to `~/.thumb_finder/logs/thumb_finder.log`.
 
 The footer displays `Thumb Finder v1.0 - Hemant`.

@@ -1,13 +1,11 @@
-# Windows installer
+# Windows portable package
 
-GitHub Actions builds the PyInstaller application folder, then uses Inno Setup
-to create `Thumb-Finder-Setup.exe`.
+The release workflow builds `dist/Thumb-Finder` with PyInstaller `--onedir`, then
+packages the complete folder as `Thumb-Finder-Windows-Portable.zip`.
 
-For a local build, first build `dist/Thumb-Finder` with PyInstaller, install
-Inno Setup 6, then run:
+Extract the ZIP and run `Thumb-Finder.exe`. Keep the whole folder together and place
+it somewhere writable by the current Windows user so the in-app updater can replace
+it. Python is not required on the user's PC.
 
-```powershell
-& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.0 installer/windows/thumb_finder.iss
-```
-
-The installer is written to `installer/windows/output/`.
+The previous Inno Setup script is retained for reference only; it is no longer used
+by the release workflow.
