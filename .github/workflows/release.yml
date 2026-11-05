@@ -1,3 +1,4 @@
+
 name: Build and publish Thumb Finder
 
 on:
@@ -34,10 +35,12 @@ jobs:
         run: |
           APP_VERSION="$(python -c 'from thumb_finder.version import __version__; print(__version__)')"
           TAG_VERSION="${REQUESTED_TAG#v}"
+
           if [ "$TAG_VERSION" != "$APP_VERSION" ]; then
             echo "Tag $REQUESTED_TAG does not match thumb_finder/version.py ($APP_VERSION)"
             exit 1
           fi
+
           echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
           echo "release_tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
 
@@ -49,12 +52,15 @@ jobs:
         include:
           - os: windows-latest
             platform: windows
-          # Native Intel build (x86_64)
+
+          # Native Intel Mac build (x86_64)
           - os: macos-15-intel
             platform: macos-intel
             architecture: x86_64
             dmg_name: Thumb-Finder-macOS-Intel.dmg
+
     runs-on: ${{ matrix.os }}
+
     steps:
       - name: Check out selected tag
         uses: actions/checkout@v4
@@ -96,9 +102,17 @@ jobs:
           choco install innosetup --no-progress -y
           $version = "${{ needs.validate.outputs.app_version }}"
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (!(Test-Path $iscc)) { throw "Inno Setup compiler not found: $iscc" }
+
+          if (!(Test-Path $iscc)) {
+            throw "Inno Setup compiler not found: $iscc"
+          }
+
           & $iscc "/DAppVersion=$version" "installer/windows/thumb_finder.iss"
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+
           if (!(Test-Path "installer/windows/output/Thumb-Finder-Setup.exe")) {
             throw "Windows installer EXE was not created"
           }
@@ -123,9 +137,10 @@ jobs:
             --add-data "thumb_finder/app_icon.svg:." \
             --add-data "thumb_finder/logo.svg:." \
             run_app.py
+
           test -d "dist/Thumb Finder.app"
 
-      - name: Create architecture-specific macOS DMG
+      - name: Create Intel macOS DMG
         if: runner.os == 'macOS'
         env:
           DMG_NAME: ${{ matrix.dmg_name }}
@@ -135,6 +150,7 @@ jobs:
             -srcfolder "dist/Thumb Finder.app" \
             -ov -format UDZO \
             "$DMG_NAME"
+
           test -f "$DMG_NAME"
 
       - name: Upload platform installer
@@ -148,7 +164,14 @@ jobs:
   publish:
     needs: [validate, build]
     runs-on: ubuntu-latest
+
     steps:
+      # FIX: Checkout repository so GitHub CLI can identify it.
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
       - name: Download platform installers
         uses: actions/download-artifact@v4
         with:
@@ -164,14 +187,22 @@ jobs:
       - name: Publish or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
           APP_VERSION: ${{ needs.validate.outputs.app_version }}
+        shell: bash
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-assets/* --clobber
-            gh release edit "$RELEASE_TAG" --title "Thumb Finder v$APP_VERSION"
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* \
+              --repo "$GH_REPO" \
+              --clobber
+
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
+              --title "Thumb Finder v$APP_VERSION"
           else
             gh release create "$RELEASE_TAG" release-assets/* \
+              --repo "$GH_REPO" \
               --title "Thumb Finder v$APP_VERSION" \
               --generate-notes
           fi
