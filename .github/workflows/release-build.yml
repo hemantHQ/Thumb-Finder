@@ -27,6 +27,9 @@ jobs:
             artifact: macos-apple-silicon-arm64
 
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
