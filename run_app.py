@@ -1,5 +1,7 @@
-"""Package entry point used by PyInstaller and local execution."""
+"""Run Thumb Finder directly from source for local debugging (no EXE build)."""
+import sys
+
 from thumb_finder.app import main
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

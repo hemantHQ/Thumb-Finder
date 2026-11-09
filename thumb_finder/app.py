@@ -1,26 +1,39 @@
-import os, sys, json, requests, logging, traceback, re, hashlib, tempfile
+import os, sys, json, requests, logging, re, threading, tempfile
 from pathlib import Path
-from datetime import datetime
-from urllib.parse import quote
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QUrl, QSize, QTimer
-from PySide6.QtGui import QPixmap, QDesktopServices, QFont, QIcon, QPainter, QColor
-from PySide6.QtWidgets import QSplashScreen
-from .updater import launch_update_helper, platform_key
+from .utils import parse_youtube_duration
+from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QUrl, QSize, QTimer, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import QPixmap, QDesktopServices, QIcon
+from PySide6.QtWidgets import QGraphicsOpacityEffect
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QComboBox, QSpinBox, QFrame, QScrollArea,
-    QGridLayout, QFileDialog, QMessageBox, QProgressBar, QDialog,
-    QFormLayout, QDialogButtonBox, QCheckBox, QSlider
+    QGridLayout, QFileDialog, QMessageBox, QProgressBar, QDialog, QSplitter, QSizePolicy,
+    QFormLayout, QDialogButtonBox, QCheckBox, QInputDialog
 )
 
-try:
-    import cv2
-    import numpy as np
-    CV_AVAILABLE = True
-except Exception:
-    cv2 = None
-    np = None
-    CV_AVAILABLE = False
+# OpenCV and NumPy are intentionally lazy-loaded. Normal startup/search should not
+# pay their import cost; they are needed only for similar-thumbnail image search.
+cv2 = None
+np = None
+CV_AVAILABLE = None
+
+def ensure_cv_available():
+    global cv2, np, CV_AVAILABLE
+    if CV_AVAILABLE is True:
+        return True
+    if CV_AVAILABLE is False:
+        return False
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+        cv2, np = _cv2, _np
+        CV_AVAILABLE = True
+        logging.info("OpenCV image-search dependencies loaded on demand")
+        return True
+    except Exception:
+        CV_AVAILABLE = False
+        logging.exception("Could not load OpenCV/NumPy for similar-image search")
+        return False
 
 try:
     from .version import __version__
@@ -33,56 +46,43 @@ except ImportError:
 APP_NAME = "Thumb Finder"
 APP_VERSION = __version__
 
+from .release_control import fetch_release_control, evaluate_release
 
-def load_build_number():
-    try:
-        from .api_config import BUILD_NUMBER
-        return int(BUILD_NUMBER)
-    except Exception:
-        try:
-            return int(os.environ.get("THUMB_FINDER_BUILD_NUMBER", "0"))
-        except (TypeError, ValueError):
-            return 0
 
-APP_BUILD = load_build_number()
 
 def load_youtube_api_key():
-    """Load CI-injected key, or environment variable for local development."""
-    try:
-        from .api_config import YOUTUBE_API_KEY
-    except ImportError:
-        try:
-            from thumb_finder.api_config import YOUTUBE_API_KEY
-        except ImportError:
-            try:
-                from api_config import YOUTUBE_API_KEY
-            except ImportError:
-                YOUTUBE_API_KEY = ""
-    return (YOUTUBE_API_KEY or os.environ.get("THUMB_FINDER_YOUTUBE_API_KEY", "")).strip()
+    """Load an optional developer-provided environment key; otherwise ask at runtime."""
+    return os.environ.get("THUMB_FINDER_YOUTUBE_API_KEY", "").strip()
 
 
-def load_github_repository():
-    """Return owner/repository used by the startup update checker."""
-    configured = ""
-    try:
-        from .api_config import GITHUB_REPOSITORY
-        configured = GITHUB_REPOSITORY
-    except ImportError:
-        configured = ""
-    return (configured or os.environ.get("THUMB_FINDER_GITHUB_REPOSITORY", "hemantHQ/Thumb-Finder")).strip()
+LOG_PATH = None
 
 
 def configure_logging():
-    """Write diagnostic logs to the user's profile, never to the install folder."""
-    log_dir = Path.home() / ".thumb_finder" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        filename=str(log_dir / "thumb_finder.log"),
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        encoding="utf-8",
-    )
-    return log_dir / "thumb_finder.log"
+    """Configure rotating diagnostics in a writable user/temp directory."""
+    global LOG_PATH
+    candidates = [Path.home() / ".thumb_finder" / "logs",
+                  Path(os.environ.get("TEMP", "/tmp")) / "ThumbFinder" / "logs"]
+    for directory in candidates:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            log_path = directory / "thumb_finder.log"
+            from logging.handlers import RotatingFileHandler
+            root = logging.getLogger()
+            root.setLevel(logging.INFO)
+            if not any(getattr(h, "baseFilename", None) == str(log_path) for h in root.handlers):
+                handler = RotatingFileHandler(log_path, maxBytes=2_000_000,
+                                              backupCount=3, encoding="utf-8")
+                handler.setFormatter(logging.Formatter(
+                    "%(asctime)s %(levelname)s %(threadName)s %(message)s"))
+                root.addHandler(handler)
+            LOG_PATH = log_path
+            return log_path
+        except Exception:
+            continue
+    logging.basicConfig(level=logging.INFO)
+    LOG_PATH = None
+    return None
 
 
 def handle_unhandled_exception(exc_type, exc_value, exc_tb):
@@ -96,19 +96,22 @@ def handle_unhandled_exception(exc_type, exc_value, exc_tb):
     )
     app = QApplication.instance()
     if app is not None:
-        QMessageBox.critical(
-            None,
-            "Thumb Finder encountered an error",
-            "An unexpected error occurred. The application has saved diagnostic "
-            "details to its log file.\n\n"
-            f"Error: {exc_value}\n\n"
-            f"Log file: {Path.home() / '.thumb_finder' / 'logs' / 'thumb_finder.log'}",
-        )
+        try:
+            QMessageBox.critical(
+                None,
+                "Thumb Finder encountered an error",
+                "An unexpected error occurred. Diagnostic details were written to the log when possible.\n\n"
+                f"Error: {exc_value}\n\n"
+                f"Log file: {LOG_PATH or 'Unavailable (see console output)'}",
+            )
+        except Exception:
+            logging.exception("Could not display the unexpected-error dialog")
 
 CONFIG_PATH = Path.home() / ".thumb_finder" / "config.json"
 DOWNLOAD_ROOT = Path.home() / "Pictures" / "Thumb Finder"
 BATCH_SIZE = 20  # Results are loaded automatically as the gallery is scrolled.
 
+# Compact search bar used while browsing the gallery.
 DARK = """
 QWidget { background:#10111b; color:#f4f3fb; font-family:'Segoe UI'; font-size:10pt; }
 QMainWindow { background:#10111b; }
@@ -143,8 +146,34 @@ QProgressBar { border:0; border-radius:4px; background:#2b2d43; height:7px; text
 QProgressBar::chunk { background:#8b80ff; border-radius:4px; }
 QCheckBox { spacing:8px; }
 QCheckBox::indicator { width:17px; height:17px; }
+QPushButton#ThemeToggle { min-width:94px; padding:9px 10px; border-radius:12px; font-weight:750; }
+QPushButton#ThemeToggle { background:#282a40; color:#f4f3fb; border:1px solid #454762; }
+QPushButton#ThemeToggle:hover { background:#353752; }
+QPushButton#CompactSearch { background:#20243a; color:#f5f4ff; border:1px solid #363b58; border-radius:12px; font-weight:700; }
 QDialog { background:#171827; }
 QDialogButtonBox QPushButton { min-width:95px; }
+
+QWidget#AppCanvas { background:#0d0f18; }
+QLabel#BrandTitle { font-size:18pt; font-weight:850; color:#f8f7ff; background:transparent; }
+QLabel#BrandSubtitle { font-size:7.5pt; letter-spacing:1.5px; font-weight:800; color:#8884b6; background:transparent; }
+QLabel#HeroTitle { font-size:25pt; font-weight:850; color:#fbfaff; background:transparent; }
+QLabel#HeroSubtitle { color:#a3a4ba; font-size:10pt; background:transparent; }
+QLabel#DurationChip { background:#24213d; border:1px solid #49416f; color:#bdb4ff; border-radius:10px; padding:6px 12px; font-weight:800; font-size:8.5pt; }
+QFrame#SearchPanel { background:#171a29; border:1px solid #2b2e45; border-radius:20px; }
+QLabel#PanelEyebrow { color:#9d94ff; font-size:8pt; font-weight:850; letter-spacing:1.2px; background:transparent; }
+QComboBox#ModeSelector, QComboBox#GenreSelector, QLineEdit#SearchInput { background:#20243a; color:#f5f4ff; border:1px solid #363b58; border-radius:12px; padding:11px 14px; }
+QComboBox#ModeSelector:focus, QComboBox#GenreSelector:focus, QLineEdit#SearchInput:focus { border:1px solid #8175f2; }
+QLabel#ImageDropZone { background:#20243a; color:#a7a8bf; border:1px dashed #575b7a; border-radius:13px; padding:10px; }
+QPushButton#PrimarySearch { background:#705ff0; color:#fff; border:0; border-radius:12px; padding:12px 18px; font-weight:850; }
+QPushButton#PrimarySearch:hover { background:#8173ff; }
+QPushButton#ToolbarButton { background:#22263b; color:#e9e8fa; border:1px solid #3a3e5b; border-radius:12px; padding:10px 14px; font-weight:750; }
+QPushButton#ToolbarButton:hover { background:#2e3350; border-color:#6962a7; }
+QPushButton#ThemeToggle { min-width:44px; max-width:44px; min-height:44px; max-height:44px; padding:0; border-radius:12px; background:#22263b; color:#f7f4ff; border:1px solid #3a3e5b; font-size:17pt; }
+QLabel#SectionHeading { font-size:17pt; font-weight:850; color:#f8f7ff; background:transparent; }
+QFrame#StatusPanel { background:#171a29; border:1px solid #2b2e45; border-radius:13px; }
+QWidget#GalleryCanvas { background:transparent; }
+QLabel#FooterLabel { color:#817fa1; font-size:7.5pt; font-weight:800; letter-spacing:1px; background:transparent; }
+QLabel#FooterSignature { color:#9b9cb2; font-size:8pt; font-weight:700; background:transparent; }
 """
 LIGHT = """
 QWidget { background:#f5f6fc; color:#22243a; font-family:'Segoe UI'; font-size:10pt; }
@@ -180,8 +209,33 @@ QProgressBar { border:0; border-radius:4px; background:#e6e7f0; height:7px; text
 QProgressBar::chunk { background:#6657e8; border-radius:4px; }
 QCheckBox { spacing:8px; }
 QCheckBox::indicator { width:17px; height:17px; }
+QPushButton#ThemeToggle { background:#ffffff; color:#393653; border:1px solid #dfe1ed; }
+QPushButton#ThemeToggle:hover { background:#f0effa; }
+QPushButton#CompactSearch { background:#f9f9fe; color:#25243d; border:1px solid #dfe1ed; border-radius:12px; font-weight:700; }
 QDialog { background:#fff; }
 QDialogButtonBox QPushButton { min-width:95px; }
+
+QWidget#AppCanvas { background:#f4f5fb; }
+QLabel#BrandTitle { font-size:18pt; font-weight:850; color:#25243b; background:transparent; }
+QLabel#BrandSubtitle { font-size:7.5pt; letter-spacing:1.5px; font-weight:800; color:#77739c; background:transparent; }
+QLabel#HeroTitle { font-size:25pt; font-weight:850; color:#22223a; background:transparent; }
+QLabel#HeroSubtitle { color:#686b82; font-size:10pt; background:transparent; }
+QLabel#DurationChip { background:#eeecff; border:1px solid #dcd7ff; color:#594cc4; border-radius:10px; padding:6px 12px; font-weight:800; font-size:8.5pt; }
+QFrame#SearchPanel { background:#ffffff; border:1px solid #e2e4ef; border-radius:20px; }
+QLabel#PanelEyebrow { color:#6657d9; font-size:8pt; font-weight:850; letter-spacing:1.2px; background:transparent; }
+QComboBox#ModeSelector, QComboBox#GenreSelector, QLineEdit#SearchInput { background:#f9f9fe; color:#25243d; border:1px solid #dfe1ed; border-radius:12px; padding:11px 14px; }
+QComboBox#ModeSelector:focus, QComboBox#GenreSelector:focus, QLineEdit#SearchInput:focus { border:1px solid #8175eb; background:#fff; }
+QLabel#ImageDropZone { background:#fafaff; color:#6d7088; border:1px dashed #c9c9df; border-radius:13px; padding:10px; }
+QPushButton#PrimarySearch { background:#6657e8; color:#fff; border:0; border-radius:12px; padding:12px 18px; font-weight:850; }
+QPushButton#PrimarySearch:hover { background:#796cf2; }
+QPushButton#ToolbarButton { background:#fff; color:#393653; border:1px solid #dedfed; border-radius:12px; padding:10px 14px; font-weight:750; }
+QPushButton#ToolbarButton:hover { background:#f0effa; border-color:#c9c4ed; }
+QPushButton#ThemeToggle { min-width:44px; max-width:44px; min-height:44px; max-height:44px; padding:0; border-radius:12px; background:#fff; color:#393653; border:1px solid #dedfed; font-size:17pt; }
+QLabel#SectionHeading { font-size:17pt; font-weight:850; color:#25243b; background:transparent; }
+QFrame#StatusPanel { background:#fff; border:1px solid #e2e4ef; border-radius:13px; }
+QWidget#GalleryCanvas { background:transparent; }
+QLabel#FooterLabel { color:#85869a; font-size:7.5pt; font-weight:800; letter-spacing:1px; background:transparent; }
+QLabel#FooterSignature { color:#73758b; font-size:8pt; font-weight:700; background:transparent; }
 """
 
 def load_config():
@@ -195,45 +249,47 @@ def load_config():
         return {}
 
 def save_config(data):
-    """Write settings atomically so an interrupted save cannot corrupt config."""
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically save local settings; return False instead of crashing a UI slot."""
     temporary = CONFIG_PATH.with_suffix(".json.tmp")
     try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(temporary, CONFIG_PATH)
+        return True
     except Exception:
         logging.exception("Could not save application settings")
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
-            pass
-        raise
+            logging.exception("Could not remove incomplete settings temp file")
+        return False
+
 
 class WorkerSignals(QObject):
     finished = Signal(object, object)
     progress = Signal(str)
 
 class SearchWorker(QRunnable):
-    """Fetch popular long-form videos; image mode compares their thumbnails locally."""
+    """Fetch YouTube videos from the original search phrase; image mode compares thumbnails locally."""
     def __init__(self, api_key, query, page_token="", batch_size=BATCH_SIZE,
-                 min_minutes=30, reference_image=""):
+                 min_minutes=40, reference_image="", movie_genre="Any genre",
+                 ):
         super().__init__()
+        self.signals = WorkerSignals()
         self.api_key, self.query, self.page_token = api_key, query, page_token
         self.batch_size = batch_size
         self.min_seconds = int(min_minutes) * 60
         self.reference_image = reference_image
         self.image_mode = bool(reference_image)
+        self.movie_genre = movie_genre
 
     @staticmethod
     def duration_seconds(value):
-        import re
-        m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value or "")
-        return (int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 +
-                int(m.group(3) or 0)) if m else 0
+        return parse_youtube_duration(value)
 
     @staticmethod
     def _visual_signature(image_bytes):
-        if not CV_AVAILABLE or not image_bytes:
+        if not image_bytes or not ensure_cv_available():
             return None
         data = np.frombuffer(image_bytes, dtype=np.uint8)
         image = cv2.imdecode(data, cv2.IMREAD_COLOR)
@@ -246,44 +302,64 @@ class SearchWorker(QRunnable):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         tiny = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
         dhash = (tiny[:, 1:] > tiny[:, :-1]).flatten()
-        return hist, dhash
+        orb = cv2.ORB_create(nfeatures=450, scaleFactor=1.2, nlevels=6)
+        _keypoints, descriptors = orb.detectAndCompute(gray, None)
+        return hist, dhash, descriptors
 
     @staticmethod
     def _similarity(a, b):
-        if a is None or b is None:
+        if a is None or b is None or not ensure_cv_available():
             return 0.0
         hist_score = max(0.0, float(cv2.compareHist(a[0], b[0], cv2.HISTCMP_CORREL)))
         hash_score = 1.0 - float(np.count_nonzero(a[1] != b[1])) / 64.0
-        return max(0.0, min(1.0, 0.55 * hist_score + 0.45 * hash_score))
+        feature_score = 0.0
+        if a[2] is not None and b[2] is not None and len(a[2]) >= 4 and len(b[2]) >= 4:
+            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            matches = matcher.match(a[2], b[2])
+            good = sum(1 for m in matches if m.distance < 58)
+            feature_score = min(1.0, good / max(12.0, min(len(a[2]), len(b[2])) * 0.18))
+        return max(0.0, min(1.0, 0.40 * hist_score + 0.25 * hash_score + 0.35 * feature_score))
 
     def run(self):
         try:
             reference_signature = None
             if self.image_mode:
-                if not CV_AVAILABLE:
-                    raise RuntimeError("Image similarity needs OpenCV and NumPy. Reinstall requirements.txt.")
+                if not ensure_cv_available():
+                    raise RuntimeError("Similar-image search needs OpenCV and NumPy. Install the project dependencies using the instructions in DEBUGGING.md.")
                 reference_bytes = Path(self.reference_image).read_bytes()
                 reference_signature = self._visual_signature(reference_bytes)
                 if reference_signature is None:
                     raise RuntimeError("The selected reference image could not be read.")
 
+            search_query = self.query
             token = self.page_token
             results, visited = [], set()
             next_token = token
             pages_checked = 0
-            # Image mode searches a larger candidate pool; matching happens on this PC.
-            max_pages = 5 if self.image_mode else 100
+            # Bound each fetch pass so the UI gets a batch quickly and API quota is controlled.
+            # Further pages are fetched only when the user scrolls for more.
+            max_pages = 5
             while len(results) < self.batch_size and pages_checked < max_pages:
                 self.signals.progress.emit(
-                    f"Finding popular videos… {len(results)}/{self.batch_size}")
+                    f"Finding popular movies… {len(results)}/{self.batch_size}")
                 params = {"part": "snippet", "type": "video", "maxResults": 50,
-                          "order": "viewCount", "key": self.api_key}
-                if self.query:
-                    params["q"] = self.query
+                          "order": "viewCount", "videoDuration": "long", "key": self.api_key,
+}
+                # YouTube exposes broad video categories, not reliable movie-genre metadata.
+                # Genre selection is therefore applied as search keywords, then duration-filtered.
+                query_parts = [search_query.strip()] if search_query.strip() else []
+                if self.movie_genre and self.movie_genre != "Any genre":
+                    query_parts.append(self.movie_genre.lower())
+                if self.image_mode and not query_parts:
+                    query_parts.append("full movie")
+                elif query_parts and not any("movie" in q.lower() or "film" in q.lower() for q in query_parts):
+                    query_parts.append("movie")
+                if query_parts:
+                    params["q"] = " ".join(query_parts)
                 if token:
                     params["pageToken"] = token
                 r = requests.get("https://www.googleapis.com/youtube/v3/search",
-                                 params=params, timeout=25)
+                                 params=params, timeout=(5, 20))
                 r.raise_for_status()
                 payload = r.json()
                 raw = payload.get("items", [])
@@ -292,10 +368,10 @@ class SearchWorker(QRunnable):
                 visited.update(ids)
                 details = {}
                 if ids:
-                    self.signals.progress.emit("Checking video duration and popularity…")
+                    self.signals.progress.emit("Checking movie duration and popularity…")
                     vr = requests.get("https://www.googleapis.com/youtube/v3/videos",
                         params={"part": "contentDetails,statistics", "id": ",".join(ids),
-                                "key": self.api_key}, timeout=25)
+                                "key": self.api_key}, timeout=(5, 20))
                     vr.raise_for_status()
                     details = {x["id"]: x for x in vr.json().get("items", [])}
                 for item in raw:
@@ -317,7 +393,7 @@ class SearchWorker(QRunnable):
                     similarity = None
                     if self.image_mode:
                         try:
-                            tr = requests.get(best, timeout=12)
+                            tr = requests.get(best, timeout=(5, 12))
                             tr.raise_for_status()
                             candidate_signature = self._visual_signature(tr.content)
                             similarity = self._similarity(reference_signature, candidate_signature)
@@ -346,15 +422,26 @@ class SearchWorker(QRunnable):
                 if not next_token or not raw:
                     break
                 if pages_checked >= max_pages:
-                    # Bound the local image-search candidate pool to avoid excessive API quota use.
-                    next_token = ""
+                    # Keep the token so another bounded page batch can load on scroll.
                     break
                 token = next_token
             # In every mode, popular videos are shown first.
-            results.sort(key=lambda x: x["views"], reverse=True)
+            if self.image_mode:
+                results.sort(key=lambda x: (x.get("similarity", 0), x["views"]), reverse=True)
+            else:
+                results.sort(key=lambda x: x["views"], reverse=True)
             self.signals.finished.emit({"items": results, "next": next_token}, None)
         except Exception as e:
-            self.signals.finished.emit(None, str(e))
+            logging.exception("Movie search worker failed")
+            message = str(e)
+            response = getattr(e, "response", None)
+            if response is not None:
+                try:
+                    payload = response.json()
+                    message = payload.get("error", {}).get("message") or message
+                except Exception:
+                    pass
+            self.signals.finished.emit(None, message)
 
 class ImageSignals(QObject):
     done = Signal(bytes)
@@ -364,143 +451,53 @@ class DownloadSignals(QObject):
 
 class DownloadWorker(QRunnable):
     def __init__(self, items, folder):
-        super().__init__(); self.items=items; self.folder=folder; self.signals=DownloadSignals()
+        super().__init__()
+        self.items = items
+        self.folder = folder
+        self.signals = DownloadSignals()
+
     def run(self):
+        saved, failed = 0, 0
         try:
-            self.folder.mkdir(parents=True,exist_ok=True); saved=0
+            self.folder.mkdir(parents=True, exist_ok=True)
             for item in self.items:
-                if not item.get("thumbnail"): continue
-                r=requests.get(item["thumbnail"],timeout=20); r.raise_for_status()
-                name="".join(c for c in item["title"] if c.isalnum() or c in " -_").strip().replace(" ","_")[:75] or item["id"]
-                content_type = r.headers.get("Content-Type", "").split(";")[0].lower()
-                ext = { "image/jpeg": ".jpg", "image/png": ".png",
-                        "image/webp": ".webp", "image/gif": ".gif" }.get(content_type, ".jpg")
-                # Preserve the original highest-available thumbnail bytes without resizing or recompressing.
-                (self.folder/f"{name}_{item['id']}{ext}").write_bytes(r.content)
-                saved += 1
-            self.signals.done.emit(f"Downloaded {saved} thumbnail(s).", "")
-        except Exception as e: self.signals.done.emit("Download failed.",str(e))
+                try:
+                    if not item.get("thumbnail"):
+                        failed += 1
+                        continue
+                    response = requests.get(item["thumbnail"], timeout=(5, 20))
+                    response.raise_for_status()
+                    safe_title = "".join(
+                        c for c in item.get("title", "thumbnail")
+                        if c.isalnum() or c in " -_").strip().replace(" ", "_")[:75]
+                    name = safe_title or item.get("id", "thumbnail")
+                    from PIL import Image
+                    from io import BytesIO
+                    target = self.folder / f"{name}_{item.get('id', saved)}.jpg"
+                    with Image.open(BytesIO(response.content)) as source:
+                        source.convert("RGB").save(target, format="JPEG", quality=95, optimize=True)
+                    saved += 1
+                except Exception:
+                    failed += 1
+                    logging.exception("Could not download thumbnail for video %s", item.get("id"))
+            summary = f"Downloaded {saved} thumbnail(s)."
+            if failed:
+                summary += f" {failed} failed. See the log for details."
+            self.signals.done.emit(summary, "" if saved else "No thumbnails could be downloaded.")
+        except Exception as exc:
+            logging.exception("Thumbnail download batch failed")
+            self.signals.done.emit("Download failed.", str(exc))
+
 
 class ImageWorker(QRunnable):
     def __init__(self, url):
         super().__init__(); self.url=url; self.signals=ImageSignals()
     def run(self):
         try:
-            r=requests.get(self.url,timeout=12); r.raise_for_status(); self.signals.done.emit(r.content)
+            r=requests.get(self.url,timeout=(5, 12)); r.raise_for_status(); self.signals.done.emit(r.content)
         except Exception:
             logging.exception("Thumbnail preview download failed: %s", self.url)
             self.signals.done.emit(b"")
-
-class UpdateSignals(QObject):
-    finished = Signal(object, object)
-
-
-def version_tuple(value):
-    """Convert a simple semantic version to comparable integer components."""
-    numbers = [int(part) for part in re.findall(r"\d+", str(value or ""))[:4]]
-    numbers += [0] * (4 - len(numbers))
-    return tuple(numbers)
-
-
-class UpdateCheckWorker(QRunnable):
-    """Check the latest public release and its build manifest."""
-    def __init__(self, repository, current_version, current_build, platform):
-        super().__init__()
-        self.repository = repository
-        self.current_version = current_version
-        self.current_build = current_build
-        self.platform = platform
-        self.signals = UpdateSignals()
-
-    def run(self):
-        try:
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository or ""):
-                raise ValueError("Update source is not configured for this build.")
-            headers = {"Accept": "application/vnd.github+json", "User-Agent": "Thumb-Finder-Updater"}
-            url = f"https://api.github.com/repos/{self.repository}/releases/latest"
-            response = requests.get(url, headers=headers, timeout=(5, 12))
-            if response.status_code == 404:
-                self.signals.finished.emit({"available": False, "no_release": True}, None)
-                return
-            response.raise_for_status()
-            release = response.json()
-            if release.get("draft") or release.get("prerelease"):
-                self.signals.finished.emit({"available": False}, None)
-                return
-            tag = str(release.get("tag_name", "")).strip()
-            latest = tag[1:] if tag.lower().startswith("v") else tag
-            if not latest:
-                raise ValueError("The latest GitHub release has no version tag.")
-            assets = {a.get("name"): a for a in release.get("assets", [])}
-            manifest_asset = assets.get("thumb-finder-update.json")
-            if not manifest_asset:
-                # Older releases can still be opened manually; they are not silently installed.
-                self.signals.finished.emit({
-                    "available": version_tuple(latest) > version_tuple(self.current_version),
-                    "manual_only": True, "latest_version": latest,
-                    "release_url": release.get("html_url", "")}, None)
-                return
-            manifest_response = requests.get(manifest_asset["browser_download_url"], headers=headers, timeout=(5, 12))
-            manifest_response.raise_for_status()
-            manifest = manifest_response.json()
-            if str(manifest.get("version", "")) != latest:
-                raise ValueError("The update manifest version does not match the GitHub release tag.")
-            remote_build = int(manifest.get("build", 0))
-            newer = (version_tuple(latest) > version_tuple(self.current_version) or
-                     (version_tuple(latest) == version_tuple(self.current_version) and remote_build > self.current_build))
-            asset_name = manifest.get("assets", {}).get(self.platform)
-            if asset_name and Path(str(asset_name)).name != str(asset_name):
-                raise ValueError("The update manifest contains an invalid package filename.")
-            asset = assets.get(asset_name) if asset_name else None
-            checksum = manifest.get("sha256", {}).get(self.platform, "")
-            if newer and (not asset or not checksum):
-                raise ValueError(f"The release is missing the {self.platform} update package or checksum.")
-            result = {
-                "available": newer, "latest_version": latest, "latest_build": remote_build,
-                "current_build": self.current_build, "release_url": release.get("html_url", ""),
-                "release_notes": release.get("body", ""),
-                "asset_url": asset.get("browser_download_url", "") if asset else "",
-                "asset_name": asset_name or "", "sha256": checksum,
-            }
-            self.signals.finished.emit(result, None)
-        except Exception as exc:
-            logging.warning("Update check failed: %s", exc, exc_info=True)
-            self.signals.finished.emit(None, str(exc))
-
-
-class UpdateDownloadWorker(QRunnable):
-    """Download a platform package and verify its SHA-256 before staging."""
-    def __init__(self, url, filename, expected_sha256):
-        super().__init__()
-        self.url, self.filename, self.expected_sha256 = url, filename, expected_sha256
-        self.signals = UpdateSignals()
-
-    def run(self):
-        try:
-            if Path(self.filename).name != self.filename or not self.filename.lower().endswith(".zip"):
-                raise ValueError("The update package filename is invalid.")
-            if not self.url.startswith("https://"):
-                raise ValueError("The update package URL must use HTTPS.")
-            response = requests.get(self.url, stream=True, timeout=(10, 90),
-                                    headers={"User-Agent": "Thumb-Finder-Updater"})
-            response.raise_for_status()
-            cache = Path.home() / ".thumb_finder" / "updates"
-            cache.mkdir(parents=True, exist_ok=True)
-            target = cache / self.filename
-            digest = hashlib.sha256()
-            with target.open("wb") as output:
-                for chunk in response.iter_content(1024 * 1024):
-                    if chunk:
-                        output.write(chunk)
-                        digest.update(chunk)
-            if digest.hexdigest().lower() != self.expected_sha256.lower():
-                target.unlink(missing_ok=True)
-                raise ValueError("Update verification failed. The downloaded file did not match its SHA-256 checksum.")
-            self.signals.finished.emit({"path": str(target)}, None)
-        except Exception as exc:
-            logging.exception("Update download failed")
-            self.signals.finished.emit(None, str(exc))
-
 
 class SettingsDialog(QDialog):
     def __init__(self, parent, download_dir):
@@ -521,7 +518,7 @@ class SettingsDialog(QDialog):
         path_row.addWidget(browse)
         form.addRow("Download location", path_row)
         layout.addLayout(form)
-        note = QLabel("YouTube API access is configured by the Thumb Finder publisher. No API key is required from users.")
+        note = QLabel("Your YouTube Data API key is stored locally in your user profile. Keep it private; it is not uploaded to Thumb Finder or GitHub.")
         note.setWordWrap(True)
         note.setObjectName("Muted")
         layout.addWidget(note)
@@ -545,15 +542,26 @@ class ThumbCard(QFrame):
         self.parent_window = parent
         self.setMinimumWidth(230)
         self.setMaximumWidth(440)
+        fade = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(fade)
+        fade.setOpacity(0.0)
+        self._fade_animation = QPropertyAnimation(fade, b"opacity", self)
+        self._fade_animation.setDuration(220)
+        self._fade_animation.setStartValue(0.0)
+        self._fade_animation.setEndValue(1.0)
+        self._fade_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._fade_animation.start()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
         self.image = QLabel("Loading preview…")
         self.image.setAlignment(Qt.AlignCenter)
-        self.image.setMinimumHeight(138)
-        self.image.setMaximumHeight(190)
-        self.image.setStyleSheet("background:rgba(120,120,140,0.12); border-radius:11px; color:#999;")
+        self.image.setMinimumHeight(165)
+        self.image.setMaximumHeight(230)
+        self.image.setStyleSheet("background:rgba(120,120,140,0.12); border-radius:11px;")
+        self.image.setMouseTracking(True)
+        self._image_hover_animation = None
         layout.addWidget(self.image)
 
         title = QLabel(item["title"])
@@ -565,11 +573,11 @@ class ThumbCard(QFrame):
         layout.addWidget(title)
 
         views = QLabel(f"◉  {item['views']:,} views")
-        views.setStyleSheet("font-weight:700;color:#8b80ff;background:transparent;border:0;")
+        views.setStyleSheet("font-weight:700;background:transparent;border:0;")
         layout.addWidget(views)
         if item.get("similarity") is not None:
             match = QLabel(f"▧  Visual match · {item['similarity'] * 100:.0f}%")
-            match.setStyleSheet("font-weight:700;color:#9b91ff;background:transparent;border:0;")
+            match.setStyleSheet("font-weight:700;background:transparent;border:0;")
             layout.addWidget(match)
         meta = QLabel(f"{item.get('published','')}   ·   {item.get('duration',0)//60} min+\n{item.get('channel','')}")
         meta.setObjectName("Muted")
@@ -587,7 +595,12 @@ class ThumbCard(QFrame):
         openb.setProperty("class", "secondary")
         openb.setStyleSheet("padding:8px 10px;font-size:9pt;")
         openb.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(item["video_url"])))
-        row.addWidget(dl, 1); row.addWidget(openb, 1)
+        editb = QPushButton("✎  Edit")
+        editb.setObjectName("Secondary")
+        editb.setProperty("class", "secondary")
+        editb.setStyleSheet("padding:8px 10px;font-size:9pt;")
+        editb.clicked.connect(lambda: parent.open_thumbnail_editor(item))
+        row.addWidget(dl, 1); row.addWidget(openb, 1); row.addWidget(editb, 1)
         layout.addLayout(row)
 
         if item.get("thumbnail"):
@@ -596,6 +609,26 @@ class ThumbCard(QFrame):
             parent.image_workers.append(worker)
             worker.signals.done.connect(lambda _data, w=worker: parent.image_workers.remove(w) if w in parent.image_workers else None)
             parent.pool.start(worker)
+
+    def _animate_thumbnail(self, hovered):
+        target = 190 if hovered else 165
+        if self._image_hover_animation is not None:
+            self._image_hover_animation.stop()
+        animation = QPropertyAnimation(self.image, b"minimumHeight", self)
+        animation.setDuration(190)
+        animation.setStartValue(self.image.minimumHeight())
+        animation.setEndValue(target)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._image_hover_animation = animation
+        animation.start()
+
+    def enterEvent(self, event):
+        self._animate_thumbnail(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate_thumbnail(False)
+        super().leaveEvent(event)
 
     def set_image(self, data):
         if not data:
@@ -612,21 +645,38 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config = load_config()
-        self.api_key = load_youtube_api_key()
-        self.github_repository = load_github_repository()
-        self.download_dir = Path(self.config.get(
-            "download_dir", str(DOWNLOAD_ROOT))).expanduser()
-        self.dark = self.config.get("dark", True)
+        self.api_key = load_youtube_api_key() or str(self.config.get("youtube_api_key", "")).strip()
+        try:
+            configured_download_dir = self.config.get("download_dir", str(DOWNLOAD_ROOT))
+            self.download_dir = Path(configured_download_dir).expanduser()
+        except (TypeError, ValueError, OSError):
+            logging.exception("Invalid saved download directory; using default")
+            self.download_dir = DOWNLOAD_ROOT
+        self.config.pop("search_language", None)
+        self.theme_preference = self.config.get("theme", "system")
+        if self.theme_preference not in ("system", "dark", "light"):
+            # Migrate older builds that stored a boolean dark setting.
+            self.theme_preference = "dark" if self.config.get("dark", False) else "system"
+        self.dark = self.resolve_system_dark() if self.theme_preference == "system" else self.theme_preference == "dark"
         self.next_token = ""
         self.last_query = ""
         self.loading_more = False
         self.auto_load_enabled = True
         self.has_more_pages = False
-        self.min_duration_minutes = int(self.config.get("min_duration_minutes", 30))
+        try:
+            self.min_duration_minutes = int(self.config.get("min_duration_minutes", 40))
+        except (TypeError, ValueError):
+            logging.exception("Invalid saved minimum duration; using 40 minutes")
+            self.min_duration_minutes = 40
+        self.min_duration_minutes = max(40, min(360, self.min_duration_minutes))
+        self.movie_genre = self.config.get("movie_genre", "Any genre")
+        if not isinstance(self.movie_genre, str):
+            self.movie_genre = "Any genre"
         self.search_folder_name = ""
         self.search_image_path = ""
         self.seen_ids = set()
         self.pool = QThreadPool.globalInstance()
+        self.search_workers = []
         self.image_workers = []
         self.download_workers = []
         self._visible_cards = []
@@ -638,17 +688,20 @@ class MainWindow(QMainWindow):
         self.app_icon_path = icon_path if icon_path.exists() else None
         if self.app_icon_path:
             self.setWindowIcon(QIcon(str(self.app_icon_path)))
-        self.setMinimumSize(1050,700)
-        self.resize(1250,820)
+        self.setMinimumSize(480,520)
+        self.resize(1240,860)
         self.build_ui()
         self.apply_theme()
 
     def run_first_launch_setup(self):
+        """Prepare writable user folders; never contact GitHub in local debug mode."""
         try:
             self.download_dir.mkdir(parents=True, exist_ok=True)
             self.config.setdefault("setup_complete", True)
             self.config.setdefault("download_dir", str(self.download_dir))
-            save_config(self.config)
+            if not save_config(self.config):
+                self.status.setText("Settings could not be saved; check user-folder permissions.")
+            return True
         except Exception as exc:
             logging.exception("First-launch setup failed")
             QMessageBox.critical(
@@ -657,303 +710,312 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        if not self.api_key:
-            logging.error("YouTube API configuration is missing from this build.")
-            QMessageBox.critical(
-                self, "Configuration unavailable",
-                "This copy does not contain the publisher's YouTube API configuration. "
-                "Please download the official release from GitHub."
+    def prompt_for_api_key(self):
+        """Ask for a key only after the main window is visible, keeping launch responsive."""
+        if self.api_key:
+            self.search_btn.setEnabled(True)
+            return True
+        self.search_btn.setEnabled(False)
+        self.status.setText("YouTube API key required before searching.")
+        key, accepted = QInputDialog.getText(
+            self, "YouTube Data API key",
+            "Enter your YouTube Data API key to use movie search:",
+            QLineEdit.Password,
+        )
+        key = key.strip()
+        if not accepted or not key:
+            self.status.setText("Add your YouTube API key to start searching.")
+            return False
+        if not key:
+            self.status.setText("No API key entered. Search remains disabled until a key is provided.")
+            return False
+        self.api_key = key
+        self.config["youtube_api_key"] = key
+        if not save_config(self.config):
+            self.api_key = ""
+            self.config.pop("youtube_api_key", None)
+            QMessageBox.warning(
+                self, "Could not save API key",
+                "The key was entered but could not be saved. Check folder permissions and try again."
             )
             return False
+        self.search_btn.setEnabled(True)
+        self.status.setText("API key saved locally. Ready to search.")
+        logging.info("YouTube API key saved to local user settings")
         return True
 
-    def start_startup_update_check(self, splash):
-        self.status.setText("Checking for updates…")
-        if not self.github_repository:
-            logging.info("Update check skipped: GitHub repository is not configured.")
-            self.show_after_startup_check(splash, None, "Update checking is not configured.")
-            return
-        worker = UpdateCheckWorker(self.github_repository, APP_VERSION, APP_BUILD, platform_key())
-        self.update_worker = worker
-        worker.signals.finished.connect(
-            lambda result, error: self.show_after_startup_check(splash, result, error)
-        )
-        self.pool.start(worker)
-
-    def show_after_startup_check(self, splash, result, error):
-        try:
-            self.show()
-            splash.finish(self)
-        except Exception:
-            logging.exception("Could not complete startup display transition")
-
-        if error:
-            self.status.setText("Couldn't check for updates. You can still use Thumb Finder.")
-            logging.warning("Startup update check did not complete: %s", error)
-            return
-
-        if result and result.get("available"):
-            QTimer.singleShot(250, lambda: self.show_update_dialog(result))
-        elif result and result.get("no_release"):
-            self.status.setText("Ready. No public release is available for update checking yet.")
-        else:
-            self.status.setText("You're using the latest version of Thumb Finder.")
-
-    def show_update_dialog(self, release):
-        latest = release.get("latest_version", "new version")
-        dialog = QMessageBox(self)
-        dialog.setIcon(QMessageBox.Information)
-        dialog.setWindowTitle("Update available")
-        dialog.setText(f"Thumb Finder v{latest} is available.")
-        dialog.setInformativeText(
-            f"Installed version: v{APP_VERSION} (build {APP_BUILD})\n"
-            f"New build: {release.get('latest_build', 'latest')}\n\n"
-            "The update will be downloaded and verified before the current app is replaced."
-        )
-        update_button = dialog.addButton("Download & update", QMessageBox.AcceptRole)
-        later_button = dialog.addButton("Later", QMessageBox.RejectRole)
-        dialog.exec()
-        if dialog.clickedButton() == update_button:
-            if release.get("manual_only"):
-                QDesktopServices.openUrl(QUrl(release.get("release_url", "https://github.com/hemantHQ/Thumb-Finder/releases/latest")))
-                return
-            self.begin_update_download(release)
-
-    def begin_update_download(self, release):
-        self.status.setText("Downloading update securely…")
-        self.progress.show()
-        worker = UpdateDownloadWorker(release["asset_url"], release["asset_name"], release["sha256"])
-        self.update_download_worker = worker
-        worker.signals.finished.connect(self.on_update_downloaded)
-        self.pool.start(worker)
-
-    def on_update_downloaded(self, result, error):
-        self.progress.hide()
-        if error or not result:
-            logging.error("Update could not be downloaded: %s", error)
-            QMessageBox.warning(self, "Update failed", f"Thumb Finder could not install the update.\n\n{error}")
-            self.status.setText("Update failed. You can continue using the current version.")
-            return
-        archive = Path(result["path"])
-        choice = QMessageBox.question(
-            self, "Update ready",
-            "The update has been downloaded and verified.\n\nRestart Thumb Finder now to replace the old version?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if choice != QMessageBox.Yes:
-            self.status.setText("Update downloaded. You can install it next time from the update prompt.")
-            return
-        try:
-            launch_update_helper(archive, os.getpid())
-            logging.info("Launching updater helper for %s", archive)
-            QApplication.quit()
-        except Exception as exc:
-            logging.exception("Could not start update helper")
-            QMessageBox.critical(self, "Update could not start", f"The update is ready but could not replace the app.\n\n{exc}\n\nYou can download it manually from the GitHub release page.")
-            QDesktopServices.openUrl(QUrl("https://github.com/hemantHQ/Thumb-Finder/releases/latest"))
-
     def build_ui(self):
+        """Build the redesigned local-first discovery workspace."""
         central = QWidget()
+        central.setObjectName("AppCanvas")
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(26, 22, 26, 20)
+        root.setContentsMargins(24, 20, 24, 18)
         root.setSpacing(18)
 
-        # Header / brand bar
-        header = QHBoxLayout()
-        header.setSpacing(13)
+        # Top navigation / brand bar (can collapse while browsing results)
+        self.top_widget = QWidget()
+        top = QHBoxLayout(self.top_widget)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(12)
         logo = QLabel()
-        logo.setFixedSize(48, 48)
+        logo.setFixedSize(46, 46)
         logo.setAlignment(Qt.AlignCenter)
         if self.app_icon_path:
-            logo.setPixmap(QIcon(str(self.app_icon_path)).pixmap(QSize(48, 48)))
+            logo.setPixmap(QIcon(str(self.app_icon_path)).pixmap(QSize(46, 46)))
         else:
             logo.setText("✦")
-            logo.setStyleSheet("background:#6657e8;color:white;border-radius:15px;font-size:24pt;font-weight:800;")
-        header.addWidget(logo)
-        brand = QVBoxLayout()
-        brand.setSpacing(0)
-        name = QLabel("Thumb Finder")
-        name.setStyleSheet("font-size:19pt;font-weight:850;letter-spacing:-0.4px;background:transparent;")
-        tagline = QLabel("Discover. Explore. Get Inspired.")
-        tagline.setObjectName("Muted")
-        tagline.setStyleSheet("font-size:9pt;background:transparent;")
-        brand.addWidget(name)
-        brand.addWidget(tagline)
-        header.addLayout(brand)
-        header.addStretch()
-        self.theme_btn = QPushButton("☀  Light mode" if self.dark else "☾  Dark mode")
-        self.theme_btn.setObjectName("Ghost")
+            logo.setStyleSheet(
+                "background:#6657e8;color:white;border-radius:14px;"
+                "font-size:23pt;font-weight:800;"
+            )
+        top.addWidget(logo)
+
+        brand_col = QVBoxLayout()
+        brand_col.setSpacing(0)
+        brand = QLabel("Thumb Finder")
+        brand.setObjectName("BrandTitle")
+        strap = QLabel("YOUTUBE THUMBNAIL TOOLS")
+        strap.setObjectName("BrandSubtitle")
+        brand_col.addWidget(brand)
+        brand_col.addWidget(strap)
+        top.addLayout(brand_col)
+        top.addStretch(1)
+
+        self.theme_btn = QPushButton()
+        self.theme_btn.setObjectName("ThemeToggle")
+        self.theme_btn.setFixedSize(44, 44)
+        self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.setToolTip("Switch light or dark appearance")
         self.theme_btn.clicked.connect(self.toggle_theme)
+        self.update_theme_button()
         settings = QPushButton("⚙  Settings")
-        settings.setObjectName("Secondary")
+        settings.setObjectName("ToolbarButton")
+        settings.setCursor(Qt.PointingHandCursor)
         settings.clicked.connect(self.open_settings)
-        header.addWidget(self.theme_btn)
-        header.addWidget(settings)
-        root.addLayout(header)
+        top.addWidget(self.theme_btn)
+        top.addWidget(settings)
+        root.addWidget(self.top_widget)
 
-        body = QHBoxLayout()
-        body.setSpacing(18)
+        # Hero heading
+        self.hero_widget = QWidget()
+        hero = QHBoxLayout(self.hero_widget)
+        hero.setContentsMargins(0, 0, 0, 0)
+        hero_col = QVBoxLayout()
+        hero_col.setSpacing(3)
+        # Keep the hero container out of the way; the search and gallery are the focus.
+        self.hero_widget.setVisible(False)
 
-        # Left search workspace
-        sidebar = QFrame()
-        sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(315)
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(20, 20, 20, 20)
-        side.setSpacing(13)
+        # Search console: compact, full-width card with all modes.
+        search_panel = QFrame()
+        self.search_panel = search_panel
+        search_panel.setObjectName("SearchPanel")
+        search_outer = QVBoxLayout(search_panel)
+        search_outer.setContentsMargins(20, 18, 20, 18)
+        self.search_panel_layout = search_outer
+        search_outer.setSpacing(13)
 
-        eyebrow = QLabel("SEARCH WORKSPACE")
-        eyebrow.setObjectName("Eyebrow")
-        side.addWidget(eyebrow)
-        search_title = QLabel("Find your next\ninspiration.")
-        search_title.setStyleSheet("font-size:19pt;font-weight:850;line-height:1.2;background:transparent;")
-        side.addWidget(search_title)
-        intro = QLabel("Explore long-form YouTube videos and save their original thumbnails.")
-        intro.setObjectName("Muted")
-        intro.setWordWrap(True)
-        intro.setStyleSheet("font-size:9pt;background:transparent;")
-        side.addWidget(intro)
-        side.addSpacing(5)
+        search_top = QHBoxLayout()
+        search_label = QLabel("SEARCH MODE")
+        search_label.setObjectName("PanelEyebrow")
+        search_top.addWidget(search_label)
+        search_top.addStretch()
+        self.mode_hint = QLabel("Search by actor, topic or reference thumbnail")
+        self.mode_hint.setObjectName("Muted")
+        search_top.addWidget(self.mode_hint)
+        self.search_top_widget = QWidget()
+        self.search_top_widget.setLayout(search_top)
+        search_outer.addWidget(self.search_top_widget)
 
-        mode_label = QLabel("SEARCH TYPE")
-        mode_label.setObjectName("Eyebrow")
-        side.addWidget(mode_label)
+        self.compact_search_btn = QPushButton("⌕   Search thumbnails   ·   Tap to expand")
+        self.compact_search_btn.setObjectName("CompactSearch")
+        self.compact_search_btn.setMinimumHeight(42)
+        self.compact_search_btn.clicked.connect(lambda: self.set_browse_compact(False))
+        self.compact_search_btn.hide()
+        search_outer.addWidget(self.compact_search_btn)
+
         self.mode = QComboBox()
-        self.mode.addItems(["Actor name", "Topic search", "Similar thumbnail image"])
-        self.mode.setToolTip("Image mode compares the selected thumbnail with popular YouTube thumbnails using local visual similarity. It does not identify people.")
+        self.mode.setObjectName("ModeSelector")
+        self.mode.addItems([
+            "⌕   Search",
+            "▧   Via photo",
+        ])
+        self.mode.setMinimumHeight(44)
+        self.mode.setToolTip("Search by actor, movie title, topic or keyword, or find visually similar thumbnails from a photo.")
         self.mode.currentIndexChanged.connect(self.update_placeholders)
-        side.addWidget(self.mode)
+        search_outer.addWidget(self.mode)
 
-        self.actor = QLineEdit()
-        self.actor.setPlaceholderText("e.g. Shah Rukh Khan — popular videos featuring this actor")
-        side.addWidget(self.actor)
-        self.topic = QLineEdit()
-        self.topic.setPlaceholderText("e.g. gaming, travel, tech reviews — popular videos first")
-        side.addWidget(self.topic)
+        self.search_input = QLineEdit()
+        self.search_input.setObjectName("SearchInput")
+        self.search_input.setPlaceholderText("Enter an actor, movie title or topic…")
+        self.search_input.setMinimumHeight(48)
+        self.search_input.returnPressed.connect(self.start_search)
+        search_outer.addWidget(self.search_input)
+        self.actor = self.search_input
+        self.topic = self.search_input
 
-        self.image_row = QHBoxLayout()
-        self.image_preview = QLabel("Choose a thumbnail to find visually similar thumbnails")
-        self.image_preview.setObjectName("Muted")
-        self.image_preview.setMinimumHeight(44)
+        self.image_row_widget = QWidget()
+        self.image_row = QHBoxLayout(self.image_row_widget)
+        self.image_row.setContentsMargins(0, 0, 0, 0)
+        self.image_row.setSpacing(12)
+        self.image_preview = QLabel(
+            "Choose a reference thumbnail to find visually similar movie artwork."
+        )
+        self.image_preview.setObjectName("ImageDropZone")
+        self.image_preview.setMinimumHeight(64)
         self.image_preview.setWordWrap(True)
-        self.image_btn = QPushButton("＋ Choose image")
-        self.image_btn.setObjectName("Secondary")
+        self.image_preview.setAlignment(Qt.AlignCenter)
+        self.image_btn = QPushButton("▧   Choose image")
+        self.image_btn.setObjectName("ToolbarButton")
+        self.image_btn.setMinimumHeight(44)
+        self.image_btn.setCursor(Qt.PointingHandCursor)
         self.image_btn.clicked.connect(self.choose_reference_image)
         self.image_row.addWidget(self.image_preview, 1)
         self.image_row.addWidget(self.image_btn)
-        side.addLayout(self.image_row)
-        self.actor_image_path = ""
+        search_outer.addWidget(self.image_row_widget)
 
-        side.addSpacing(4)
-        duration_label = QLabel("MINIMUM VIDEO LENGTH")
-        duration_label.setObjectName("Eyebrow")
-        side.addWidget(duration_label)
-        self.duration_choice = QComboBox()
-        self.duration_choice.addItems(["30 minutes+", "40 minutes+", "50 minutes+", "Custom…"])
-        preset = {30: 0, 40: 1, 50: 2}.get(self.min_duration_minutes, 3)
-        self.duration_choice.setCurrentIndex(preset)
-        side.addWidget(self.duration_choice)
-        self.custom_minutes = QSpinBox()
-        self.custom_minutes.setRange(30, 360)
-        self.custom_minutes.setSingleStep(5)
-        self.custom_minutes.setSuffix(" minutes+")
-        self.custom_minutes.setValue(max(30, min(360, self.min_duration_minutes)))
-        self.custom_minutes.setVisible(preset == 3)
-        self.custom_minutes.setToolTip("Set any minimum duration from 30 to 360 minutes.")
-        side.addWidget(self.custom_minutes)
-        self.duration_choice.currentIndexChanged.connect(
-            lambda i: self.custom_minutes.setVisible(i == 3))
-
+        filter_row = QHBoxLayout()
+        self.genre_filter_widget = QWidget()
+        genre_filter_layout = QHBoxLayout(self.genre_filter_widget)
+        genre_filter_layout.setContentsMargins(0, 0, 0, 0)
+        genre_filter_layout.setSpacing(8)
+        self.genre_toggle = QPushButton("＋  Add genre filter")
+        self.genre_toggle.setObjectName("Ghost")
+        self.genre_toggle.setMinimumHeight(40)
+        self.genre_toggle.setCheckable(True)
+        self.genre_toggle.toggled.connect(self.toggle_genre_filter)
+        genre_filter_layout.addWidget(self.genre_toggle)
+        self.genre_choice = QComboBox()
+        self.genre_choice.setObjectName("GenreSelector")
+        self.genre_choice.setMinimumHeight(42)
+        genre_items = [
+            ("🎬  Any genre", "Any genre"),
+            ("💥  Action", "Action"), ("🧭  Adventure", "Adventure"),
+            ("✨  Animation", "Animation"), ("😂  Comedy", "Comedy"),
+            ("🕵  Crime", "Crime"), ("🎥  Documentary", "Documentary"),
+            ("🎭  Drama", "Drama"), ("👨‍👩‍👧  Family", "Family"),
+            ("🐉  Fantasy", "Fantasy"), ("👻  Horror", "Horror"),
+            ("🔎  Mystery", "Mystery"), ("❤️  Romance", "Romance"),
+            ("🚀  Science Fiction", "Science Fiction"),
+            ("😱  Thriller", "Thriller"), ("⚔  War", "War"),
+            ("🤠  Western", "Western"),
+        ]
+        for visible, value in genre_items:
+            self.genre_choice.addItem(visible, value)
+        genre_index = self.genre_choice.findData(self.movie_genre)
+        self.genre_choice.setCurrentIndex(genre_index if genre_index >= 0 else 0)
+        self.genre_choice.setToolTip(
+            "Genre keywords are applied to actor and normal text searches."
+        )
+        genre_filter_layout.addWidget(self.genre_choice, 0)
+        self.genre_choice.setVisible(False)
+        filter_row.addWidget(self.genre_filter_widget, 0)
+        filter_row.addStretch(1)
         self.search_btn = QPushButton("⌕   Find thumbnails")
-        self.search_btn.setMinimumHeight(48)
+        self.search_btn.setObjectName("PrimarySearch")
+        self.search_btn.setMinimumHeight(46)
+        self.search_btn.setMinimumWidth(190)
+        self.search_btn.setCursor(Qt.PointingHandCursor)
         self.search_btn.clicked.connect(self.start_search)
-        side.addWidget(self.search_btn)
-        side.addStretch(1)
+        filter_row.addWidget(self.search_btn)
+        self.filter_row_widget = QWidget()
+        self.filter_row_widget.setLayout(filter_row)
+        search_outer.addWidget(self.filter_row_widget)
+        root.addWidget(search_panel)
 
-        tip = QFrame()
-        tip.setStyleSheet("background:rgba(102,87,232,0.12);border:1px solid rgba(130,117,255,0.25);border-radius:12px;")
-        tip_l = QVBoxLayout(tip)
-        tip_l.setContentsMargins(12, 10, 12, 10)
-        tip_l.setSpacing(4)
-        tip_head = QLabel("✦  Smart filtering")
-        tip_head.setStyleSheet("font-weight:750;color:#9b91ff;background:transparent;border:0;")
-        tip_body = QLabel("Only videos meeting your minimum length are shown. Popular results load automatically as you scroll.")
-        tip_body.setWordWrap(True)
-        tip_body.setStyleSheet("font-size:8.5pt;color:#a7a5bf;background:transparent;border:0;")
-        tip_l.addWidget(tip_head)
-        tip_l.addWidget(tip_body)
-        side.addWidget(tip)
-        body.addWidget(sidebar)
-
-        # Right results workspace
-        content = QVBoxLayout()
-        content.setSpacing(13)
-        content_header = QHBoxLayout()
-        heading_col = QVBoxLayout()
-        heading_col.setSpacing(2)
-        results_title = QLabel("Your gallery")
-        results_title.setObjectName("PageTitle")
-        self.result_label = QLabel("Your saved-worthy thumbnail discoveries will appear here.")
+        # Results header
+        self.results_header_widget = QWidget()
+        results_bar = QHBoxLayout(self.results_header_widget)
+        results_bar.setContentsMargins(0, 0, 0, 0)
+        results_col = QVBoxLayout()
+        results_col.setSpacing(2)
+        results_title = QLabel("Explore thumbnails")
+        results_title.setObjectName("SectionHeading")
+        self.result_label = QLabel("")
         self.result_label.setObjectName("Muted")
-        self.result_label.setStyleSheet("font-size:9pt;background:transparent;")
-        heading_col.addWidget(results_title)
-        heading_col.addWidget(self.result_label)
-        content_header.addLayout(heading_col)
-        content_header.addStretch()
+        self.result_label.setWordWrap(True)
+        results_col.addWidget(results_title)
+        results_col.addWidget(self.result_label)
+        results_bar.addLayout(results_col, 1)
         self.download_all_btn = QPushButton("↓  Download all shown")
-        self.download_all_btn.setObjectName("Secondary")
+        self.download_all_btn.setObjectName("ToolbarButton")
         self.download_all_btn.setEnabled(False)
         self.download_all_btn.clicked.connect(self.download_all)
-        content_header.addWidget(self.download_all_btn)
-        content.addLayout(content_header)
+        results_bar.addWidget(self.download_all_btn, 0, Qt.AlignVCenter)
+        root.addWidget(self.results_header_widget)
 
+        # Search status
         status_panel = QFrame()
-        status_panel.setObjectName("Panel")
+        status_panel.setObjectName("StatusPanel")
         status_l = QHBoxLayout(status_panel)
-        status_l.setContentsMargins(14, 10, 14, 10)
-        self.status = QLabel("Ready when you are. Choose a search type to get started.")
+        status_l.setContentsMargins(14, 9, 14, 9)
+        self.status = QLabel("Ready")
         self.status.setObjectName("Muted")
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
-        self.progress.hide()
-        self.progress.setMaximumWidth(170)
         self.progress.setTextVisible(False)
+        self.progress.setFixedWidth(145)
+        self.progress.hide()
+        self._loading_dots = 0
+        self.loading_timer = QTimer(self)
+        self.loading_timer.setInterval(360)
+        self.loading_timer.timeout.connect(self._animate_loading_status)
         status_l.addWidget(self.status, 1)
         status_l.addWidget(self.progress)
-        content.addWidget(status_panel)
+        self.status_panel = status_panel
+        root.addWidget(status_panel)
 
+        # Gallery fills remaining space and adapts columns to window width.
         self.scroll = QScrollArea()
+        self.scroll.setObjectName("ResultsScroll")
         self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
         self.gallery = QWidget()
-        self.gallery.setStyleSheet("background:transparent;")
+        self.gallery.setObjectName("GalleryCanvas")
         self.grid = QGridLayout(self.gallery)
         self.grid.setContentsMargins(2, 2, 8, 8)
-        self.grid.setHorizontalSpacing(13)
-        self.grid.setVerticalSpacing(13)
+        self.grid.setHorizontalSpacing(16)
+        self.grid.setVerticalSpacing(16)
         self.scroll.setWidget(self.gallery)
         self.scroll.verticalScrollBar().valueChanged.connect(self.on_gallery_scroll)
-        content.addWidget(self.scroll, 1)
+        root.addWidget(self.scroll, 1)
 
-        footer = QHBoxLayout()
-        self.footer_hint = QLabel("YOUTUBE DATA API  ·  POPULAR LONG-FORM VIDEOS")
-        self.footer_hint.setObjectName("Eyebrow")
-        footer.addWidget(self.footer_hint)
+        # Footer
+        self.footer_widget = QWidget()
+        footer = QHBoxLayout(self.footer_widget)
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer_text = QLabel("YOUTUBE THUMBNAILS")
+        footer_text.setObjectName("FooterLabel")
+        footer.addWidget(footer_text)
         footer.addStretch()
-        auto_hint = QLabel("AUTO-LOAD ON SCROLL")
-        auto_hint.setObjectName("Eyebrow")
-        footer.addWidget(auto_hint)
-        footer.addSpacing(18)
         signature = QLabel("Thumb Finder v1.0 - Hemant")
-        signature.setObjectName("Muted")
-        signature.setStyleSheet("font-size:8.5pt;font-weight:700;background:transparent;")
+        signature.setObjectName("FooterSignature")
         footer.addWidget(signature)
-        content.addLayout(footer)
-        body.addLayout(content, 1)
-        root.addLayout(body, 1)
+        root.addWidget(self.footer_widget)
 
+        self._browse_compact = False
         self.mode.setCurrentIndex(1)
         self.update_placeholders()
         self.show_empty_state()
+
+    def _animate_loading_status(self):
+        if not self.loading_more:
+            self.loading_timer.stop()
+            return
+        self._loading_dots = (self._loading_dots + 1) % 4
+        base = getattr(self, "_loading_base_text", "Searching movies")
+        self.status.setText(base + "." * self._loading_dots)
+
+    def set_loading_state(self, active, message="Searching movies"):
+        self.loading_more = bool(active)
+        if active:
+            self._loading_base_text = message.rstrip(".")
+            self.progress.show()
+            if not self.loading_timer.isActive():
+                self.loading_timer.start()
+        else:
+            self.loading_timer.stop()
+            self.progress.hide()
 
     def show_empty_state(self):
         self.empty_state = QFrame()
@@ -964,24 +1026,29 @@ class MainWindow(QMainWindow):
         icon = QLabel("▧")
         icon.setAlignment(Qt.AlignCenter)
         icon.setStyleSheet("font-size:34pt;color:#8175eb;background:transparent;")
-        title = QLabel("Your inspiration starts here")
+        title = QLabel("Find movie thumbnails")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size:15pt;font-weight:800;background:transparent;")
-        desc = QLabel("Search popular videos by actor, explore a topic, or choose a thumbnail to find visually similar results.")
-        desc.setAlignment(Qt.AlignCenter)
-        desc.setWordWrap(True)
-        desc.setObjectName("Muted")
         box.addWidget(icon)
         box.addWidget(title)
-        box.addWidget(desc)
         self.grid.addWidget(self.empty_state, 0, 0, 1, 4)
+
+    def toggle_genre_filter(self, checked):
+        self.genre_choice.setVisible(bool(checked))
+        self.genre_toggle.setText("−  Hide genre filter" if checked else "＋  Add genre filter")
 
     def update_placeholders(self):
         idx = self.mode.currentIndex()
-        self.actor.setVisible(idx == 0)
-        self.topic.setVisible(idx == 1)
-        self.image_preview.setVisible(idx == 2)
-        self.image_btn.setVisible(idx == 2)
+        self.search_input.setVisible(idx == 0)
+        self.image_row_widget.setVisible(idx == 1)
+        self.genre_filter_widget.setVisible(idx == 0 and not getattr(self, "_browse_compact", False))
+        self.mode_hint.setText(
+            "Enter an actor, movie or topic — search intent is detected automatically."
+            if idx == 0 else
+            "Choose a thumbnail photo to find visually similar results and infer its broad visual category."
+        )
+        if hasattr(self, "search_btn"):
+            self.search_btn.setText("⌕   Search thumbnails" if idx == 0 else "▧   Find similar thumbnails")
 
     def choose_reference_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -998,58 +1065,201 @@ class MainWindow(QMainWindow):
         else:
             self.image_preview.setText(Path(path).name)
 
-    def apply_theme(self):
-        QApplication.instance().setStyleSheet(DARK if self.dark else LIGHT)
-        self.theme_btn.setText("☀  Light mode" if self.dark else "☾  Dark mode")
+    @staticmethod
+    def resolve_system_dark():
+        try:
+            scheme = QApplication.instance().styleHints().colorScheme()
+            return scheme == Qt.ColorScheme.Dark
+        except Exception:
+            # Safe fallback when the platform does not expose a color scheme.
+            return False
+
+    def apply_theme(self, animate=False):
+        app = QApplication.instance()
+        app.setStyleSheet(DARK if self.dark else LIGHT)
+        if hasattr(self, "theme_btn"):
+            self.update_theme_button()
+        if animate and hasattr(self, "centralWidget") and self.centralWidget():
+            effect = QGraphicsOpacityEffect(self.centralWidget())
+            self.centralWidget().setGraphicsEffect(effect)
+            effect.setOpacity(0.72)
+            animation = QPropertyAnimation(effect, b"opacity", self)
+            animation.setDuration(180)
+            animation.setStartValue(0.72)
+            animation.setEndValue(1.0)
+            animation.setEasingCurve(QEasingCurve.OutCubic)
+            animation.finished.connect(lambda: self.centralWidget().setGraphicsEffect(None))
+            self._theme_animation = animation
+            animation.start()
+
+    def update_theme_button(self):
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.setText("☀" if self.dark else "☾")
+            self.theme_btn.setToolTip("Switch to light mode" if self.dark else "Switch to dark mode")
+            self.theme_btn.setFixedSize(44, 44)
 
     def toggle_theme(self):
         self.dark = not self.dark
-        self.config["dark"] = self.dark; save_config(self.config)
-        self.apply_theme()
+        if hasattr(self, "theme_btn"):
+            effect = self.theme_btn.graphicsEffect()
+            if not isinstance(effect, QGraphicsOpacityEffect):
+                effect = QGraphicsOpacityEffect(self.theme_btn)
+                self.theme_btn.setGraphicsEffect(effect)
+            fade_out = QPropertyAnimation(effect, b"opacity", self)
+            fade_out.setDuration(120)
+            fade_out.setStartValue(1.0)
+            fade_out.setEndValue(0.15)
+            fade_out.setEasingCurve(QEasingCurve.OutCubic)
+            def swap_theme_icon():
+                self.apply_theme(animate=False)
+                fade_in = QPropertyAnimation(effect, b"opacity", self)
+                fade_in.setDuration(220)
+                fade_in.setStartValue(0.15)
+                fade_in.setEndValue(1.0)
+                fade_in.setEasingCurve(QEasingCurve.OutBack)
+                fade_in.finished.connect(lambda: self.theme_btn.setGraphicsEffect(None))
+                self._theme_icon_animation = fade_in
+                fade_in.start()
+            fade_out.finished.connect(swap_theme_icon)
+            self._theme_icon_animation = fade_out
+            fade_out.start()
+        else:
+            self.apply_theme(animate=False)
+        self.theme_preference = "dark" if self.dark else "light"
+        self.config["theme"] = self.theme_preference
+        self.config.pop("dark", None)
+        if not save_config(self.config):
+            self.status.setText("Theme changed for this session, but the preference could not be saved.")
 
     def open_settings(self):
-        d = SettingsDialog(self, self.download_dir)
-        if d.exec():
-            self.download_dir = Path(d.download_path.text().strip()).expanduser()
-            self.config["download_dir"] = str(self.download_dir)
-            save_config(self.config)
-            self.status.setText("Settings saved locally.")
+        try:
+            d = SettingsDialog(self, self.download_dir)
+            if d.exec():
+                selected = d.download_path.text().strip()
+                if not selected:
+                    raise ValueError("Choose a valid download folder.")
+                self.download_dir = Path(selected).expanduser()
+                self.download_dir.mkdir(parents=True, exist_ok=True)
+                self.config["download_dir"] = str(self.download_dir)
+                if save_config(self.config):
+                    self.status.setText("Settings saved locally.")
+                else:
+                    self.status.setText("Settings could not be saved; check folder permissions.")
+        except Exception as exc:
+            logging.exception("Settings dialog failed")
+            QMessageBox.warning(self, "Settings error", str(exc))
 
     def selected_min_minutes(self):
-        index = self.duration_choice.currentIndex()
-        return (30, 40, 50)[index] if index < 3 else self.custom_minutes.value()
+        return 40
+
+    @staticmethod
+    def classify_search_text(text):
+        """Lightweight local intent hint; YouTube results remain the source of truth."""
+        value = " ".join(text.strip().split())
+        low = value.casefold()
+        topic_terms = {
+            "action", "adventure", "comedy", "horror", "thriller", "romance",
+            "sci-fi", "science fiction", "space", "haunted", "survival",
+            "explained", "review", "edit", "scene", "scenes", "wallpaper",
+            "animation", "cartoon", "gaming", "nature", "travel", "tutorial",
+            "compilation", "best", "top"
+        }
+        if any(term in low for term in topic_terms):
+            return "topic"
+        words = value.split()
+        known_single_names = {"salman", "aamir", "akshay", "hrithik", "deepika",
+                              "ranbir", "ranveer", "prabhas", "vijay", "ajith",
+                              "rajini", "kamal", "mohanlal", "mammootty",
+                              "tom", "brad", "leonardo", "dwayne", "jackie"}
+        if len(words) == 1 and low in known_single_names:
+            return "actor"
+        # Multi-word proper-name-like phrases are treated as actor/person searches.
+        if 2 <= len(words) <= 4 and all(w[:1].isupper() for w in words if w):
+            return "actor"
+        return "topic"
 
     def make_query(self):
-        mode = self.mode.currentIndex()
-        if mode == 0:
-            actor = self.actor.text().strip()
-            if not actor:
-                raise ValueError("Enter an actor name.")
-            return actor, ""
-        if mode == 1:
-            topic = self.topic.text().strip()
-            if not topic:
-                raise ValueError("Enter a topic or keyword.")
-            return topic, ""
+        if self.mode.currentIndex() == 0:
+            query = self.search_input.text().strip()
+            if not query:
+                raise ValueError("Enter an actor name, movie title or topic.")
+            intent = self.classify_search_text(query)
+            self.detected_search_intent = intent
+            if intent == "actor":
+                return f"{query} movies", ""
+            return f"{query} movie", ""
         if not self.actor_image_path:
-            raise ValueError("Choose a reference thumbnail image first.")
+            raise ValueError("Choose a reference thumbnail photo first.")
         return "", self.actor_image_path
 
     def start_search(self):
-        try: query, image_path = self.make_query()
+        self.set_browse_compact(False)
+        self.scroll.verticalScrollBar().setValue(0)
+        try:
+            query, image_path = self.make_query()
         except ValueError as e:
-            QMessageBox.warning(self,"Missing search input",str(e)); return
+            QMessageBox.warning(self, "Missing search input", str(e))
+            return
+        if not self.api_key and not self.prompt_for_api_key():
+            return
         self.last_query = query
         self.search_image_path = image_path
         self.search_folder_name = query or ("similar_thumbnails_" + Path(image_path).stem)
-        self.min_duration_minutes = self.selected_min_minutes()
-        self.config["min_duration_minutes"] = self.min_duration_minutes
-        save_config(self.config)
+        self.min_duration_minutes = 40
+        self.movie_genre = (
+            (self.genre_choice.currentData() or "Any genre")
+            if self.mode.currentIndex() == 0 and self.genre_toggle.isChecked() else "Any genre"
+        )
+        self.config.pop("min_duration_minutes", None)
+        self.config["movie_genre"] = self.movie_genre
+        self.config.pop("search_language", None)
+        self.config.pop("search_region", None)
+        if not save_config(self.config):
+            self.status.setText("Search preferences could not be saved; continuing with current selections.")
         self.next_token = ""; self.seen_ids.clear(); self.pending_items=[]; self.current_batch=[]
         self.loading_more = False; self.has_more_pages = False
         self.clear_gallery()
         self._visible_cards = []
         self.run_search("")
+
+    def search_single_video(self, video_id):
+        self.loading_more = True
+        self.search_btn.setEnabled(False)
+        self.set_loading_state(True, "Fetching video thumbnail")
+        if not hasattr(self, "_video_bridge"):
+            from PySide6.QtCore import QObject, Signal
+            class Bridge(QObject):
+                done = Signal(object, object)
+            self._video_bridge = Bridge(self)
+            self._video_bridge.done.connect(self._single_video_finished)
+        threading.Thread(target=lambda: self._video_bridge.done.emit(*self._fetch_video(video_id)), daemon=True).start()
+
+    def _fetch_video(self, video_id):
+        try:
+            response = requests.get("https://www.googleapis.com/youtube/v3/videos",
+                params={"part":"snippet,statistics,contentDetails","id":video_id,"key":self.api_key}, timeout=(5,20))
+            response.raise_for_status()
+            items=response.json().get("items", [])
+            if not items: raise ValueError("YouTube video was not found or is unavailable.")
+            item=items[0]; sn=item.get("snippet",{}); thumbs=sn.get("thumbnails",{})
+            quality=next((k for k in ("maxres","standard","high","medium","default") if thumbs.get(k,{}).get("url")),"default")
+            stats=item.get("statistics",{})
+            return ({"id":video_id,"title":sn.get("title","Untitled"),"channel":sn.get("channelTitle",""),
+                "published":sn.get("publishedAt","")[:10],"views":int(stats.get("viewCount",0)),
+                "thumbnail":thumbs.get(quality,{}).get("url",""),"thumbnail_quality":quality,
+                "duration":parse_youtube_duration(item.get("contentDetails",{}).get("duration","")),
+                "video_url":"https://www.youtube.com/watch?v="+video_id}, None)
+        except Exception as exc:
+            return None, str(exc)
+
+    def _single_video_finished(self, item, error):
+        self.set_loading_state(False); self.loading_more=False; self.search_btn.setEnabled(True)
+        if error:
+            self.status.setText("Could not load video")
+            QMessageBox.warning(self, "Video link", error); return
+        self.clear_gallery(); self._visible_cards=[]; self.add_cards([item])
+        self.seen_ids={item["id"]}; self.result_label.setText("Video thumbnail")
+        self.status.setText("Thumbnail ready"); self.download_all_btn.setEnabled(True); self.has_more_pages=False
 
     def next_batch(self):
         if self.loading_more or not self.has_more_pages:
@@ -1063,26 +1273,47 @@ class MainWindow(QMainWindow):
             self.has_more_pages = False
 
     def run_search(self, token):
-        self.loading_more = True
-        self.search_btn.setEnabled(False)
-        self.progress.show()
-        self.status.setText(f"Searching popular videos ({self.min_duration_minutes} min+)…")
-        worker = SearchWorker(self.api_key, self.last_query, token, BATCH_SIZE,
-                              self.min_duration_minutes, self.search_image_path)
-        worker.signals.finished.connect(self.search_finished)
-        worker.signals.progress.connect(self.status.setText)
-        self.pool.start(worker)
+        try:
+            self.loading_more = True
+            self.search_btn.setEnabled(False)
+            self.set_loading_state(True, "Searching YouTube thumbnails…")
+            worker = SearchWorker(
+                self.api_key, self.last_query, token, BATCH_SIZE,
+                self.min_duration_minutes, self.search_image_path, self.movie_genre
+            )
+            self.search_workers.append(worker)
+            worker.signals.finished.connect(
+                lambda data, error, w=worker: self._search_worker_finished(w, data, error))
+            worker.signals.progress.connect(self.status.setText)
+            self.pool.start(worker)
+        except Exception as exc:
+            self.loading_more = False
+            self.set_loading_state(False)
+            self.search_btn.setEnabled(True)
+            logging.exception("Could not start movie search")
+            QMessageBox.critical(self, "Search could not start", str(exc))
+
+    def _search_worker_finished(self, worker, data, error):
+        if worker in self.search_workers:
+            self.search_workers.remove(worker)
+        self.search_finished(data, error)
 
     def search_finished(self, data, error):
-        self.progress.hide(); self.search_btn.setEnabled(True)
+        self.set_loading_state(False)
+        self.search_btn.setEnabled(True)
         self.loading_more = False
         if error:
             self.has_more_pages = False
             self.status.setText("Search failed.")
             QMessageBox.critical(self,"YouTube search error",error+"\n\nCheck your internet connection and YouTube API configuration/quota.")
             return
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            logging.error("Search worker returned an invalid response: %r", data)
+            self.status.setText("Search returned an invalid response. Please try again.")
+            QMessageBox.warning(self, "Search error", "The search returned an unexpected response. See the diagnostic log.")
+            return
         known = self.seen_ids | {x["id"] for x in self.pending_items}
-        self.pending_items.extend(x for x in data["items"] if x["id"] not in known)
+        self.pending_items.extend(x for x in data["items"] if x.get("id") and x["id"] not in known)
         self.next_token = data["next"]
         self.has_more_pages = bool(self.pending_items or self.next_token)
         if len(self.pending_items) >= BATCH_SIZE or not self.next_token:
@@ -1096,21 +1327,21 @@ class MainWindow(QMainWindow):
         self.seen_ids.update(x["id"] for x in fresh)
         self.add_cards(fresh)
         mode_name = ("similar thumbnails" if self.search_image_path else
-                     ("actor videos" if self.mode.currentIndex() == 0 else "topic videos"))
-        self.result_label.setText(f"{len(self.seen_ids)} {mode_name} found  ·  popular videos first")
-        self.status.setText(f"Showing {len(fresh)} popular videos ({self.min_duration_minutes} min+). Scroll for more.")
+                     ("actor-related movies" if getattr(self, "detected_search_intent", "topic") == "actor" else "movie/topic results"))
+        self.result_label.setText(f"{len(self.seen_ids)} {mode_name} found  ·  popular movies first")
+        self.status.setText(f"Showing {len(fresh)} popular movies ({self.min_duration_minutes} min+). Scroll for more.")
         self.download_all_btn.setEnabled(bool(self.seen_ids))
         self.has_more_pages = bool(self.pending_items or self.next_token)
         if not fresh and self.next_token:
             self.run_search(self.next_token)
         elif not fresh and not self.seen_ids:
-            self.status.setText("No matching videos found. Try another search or a shorter minimum duration.")
+            self.status.setText("No matching videos found. Try another search, genre or a shorter minimum duration.")
             self.result_label.setText("No matching videos found")
             empty = QFrame(); empty.setObjectName("Panel")
             box = QVBoxLayout(empty); box.setAlignment(Qt.AlignCenter)
             title = QLabel("No thumbnails found this time")
             title.setStyleSheet("font-size:14pt;font-weight:800;background:transparent;")
-            detail = QLabel("Try a broader actor or topic, a different reference image, or a shorter duration filter.")
+            detail = QLabel("Try another actor, topic, genre or reference image.")
             detail.setWordWrap(True); detail.setAlignment(Qt.AlignCenter); detail.setObjectName("Muted")
             box.addWidget(title); box.addWidget(detail)
             self.grid.addWidget(empty, 0, 0, 1, 4)
@@ -1130,14 +1361,19 @@ class MainWindow(QMainWindow):
             w = item.widget()
             if w:
                 w.deleteLater()
-        self.result_label.setText("Searching for popular long-form videos…")
+        self.result_label.setText("Finding matching thumbnails…")
         self.download_all_btn.setEnabled(False)
 
     def add_cards(self, items):
         self._visible_cards = getattr(self, "_visible_cards", [])
-        self._visible_cards.extend(ThumbCard(item, self) for item in items)
-        self.reflow_gallery()
-        self.current_batch = items
+        new_cards = [ThumbCard(item, self) for item in items]
+        self._visible_cards.extend(new_cards)
+        for card in new_cards:
+            effect = QGraphicsOpacityEffect(card); card.setGraphicsEffect(effect); effect.setOpacity(0.0)
+            anim = QPropertyAnimation(effect, b"opacity", card); anim.setDuration(300)
+            anim.setStartValue(0.0); anim.setEndValue(1.0); anim.setEasingCurve(QEasingCurve.OutQuart)
+            card._entry_animation = anim; anim.start()
+        self.reflow_gallery(); self.current_batch = items
 
     def reflow_gallery(self):
         cards = getattr(self, "_visible_cards", [])
@@ -1146,8 +1382,8 @@ class MainWindow(QMainWindow):
         while self.grid.count():
             item = self.grid.takeAt(0)
             # Keep the widgets alive while moving them to their new positions.
-        width = max(500, self.scroll.viewport().width())
-        columns = max(1, min(4, width // 275))
+        width = max(260, self.scroll.viewport().width())
+        columns = max(1, min(4, width // 285))
         for col in range(4):
             self.grid.setColumnStretch(col, 1 if col < columns else 0)
         for i, card in enumerate(cards):
@@ -1155,8 +1391,36 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "centralWidget") and self.centralWidget():
+            compact = self.width() < 850
+            margins = (14, 12, 14, 12) if compact else (24, 20, 24, 18)
+            layout = self.centralWidget().layout()
+            if layout:
+                layout.setContentsMargins(*margins)
+                layout.setSpacing(12 if compact else 18)
+            if hasattr(self, "search_btn"):
+                self.search_btn.setMinimumWidth(150 if compact else 190)
         if hasattr(self, "_visible_cards"):
             self.reflow_gallery()
+
+    def open_thumbnail_editor(self, item):
+        """Download the selected thumbnail locally, then open the non-destructive editor."""
+        try:
+            from .editor import ThumbnailEditor
+            response = requests.get(item.get("thumbnail", ""), timeout=(5, 25))
+            response.raise_for_status()
+            from PIL import Image
+            from io import BytesIO
+            handle = tempfile.NamedTemporaryFile(prefix="thumb_finder_edit_", suffix=".jpg", delete=False)
+            temp_path = Path(handle.name)
+            handle.close()
+            with Image.open(BytesIO(response.content)) as source:
+                source.convert("RGB").save(temp_path, format="JPEG", quality=95)
+            dialog = ThumbnailEditor(temp_path, self)
+            dialog.exec()
+        except Exception as exc:
+            logging.exception("Could not open thumbnail editor")
+            QMessageBox.warning(self, "Editor unavailable", f"Could not download or open this thumbnail.\n\n{exc}")
 
     def download_item(self, item):
         self.start_download([item])
@@ -1164,12 +1428,20 @@ class MainWindow(QMainWindow):
         items=[card.item for card in getattr(self, "_visible_cards", [])]
         if items: self.start_download(items)
     def start_download(self, items):
-        folder=self.download_dir/self.safe_name(self.search_folder_name or self.last_query or "similar_thumbnails")
-        worker=DownloadWorker(items,folder); self.download_workers.append(worker)
-        worker.signals.done.connect(self.download_finished)
-        worker.signals.done.connect(lambda _a, _b, w=worker: self.download_workers.remove(w) if w in self.download_workers else None)
-        self.status.setText("Downloading thumbnails in background…")
-        self.pool.start(worker)
+        try:
+            folder = self.download_dir / self.safe_name(
+                self.search_folder_name or self.last_query or "similar_thumbnails")
+            worker = DownloadWorker(items, folder)
+            self.download_workers.append(worker)
+            worker.signals.done.connect(self.download_finished)
+            worker.signals.done.connect(
+                lambda _a, _b, w=worker: self.download_workers.remove(w)
+                if w in self.download_workers else None)
+            self.status.setText("Downloading thumbnails in background…")
+            self.pool.start(worker)
+        except Exception as exc:
+            logging.exception("Could not start thumbnail download")
+            QMessageBox.warning(self, "Download error", str(exc))
     def download_finished(self, message, error):
         self.status.setText(message)
         if error:
@@ -1179,7 +1451,60 @@ class MainWindow(QMainWindow):
                 self.search_folder_name or self.last_query or "similar_thumbnails")
             QMessageBox.information(self, "Download complete", f"{message}\nSaved to:\n{folder}")
 
+    def set_browse_compact(self, compact):
+        """Collapse the search area into a slim expandable bar while browsing."""
+        compact = bool(compact)
+        if compact == getattr(self, "_browse_compact", False):
+            return
+        self._browse_compact = compact
+        self.top_widget.setVisible(not compact)
+        self.hero_widget.setVisible(False)
+        self.results_header_widget.setVisible(not compact)
+        self.status_panel.setVisible(not compact)
+        self.footer_widget.setVisible(not compact)
+        self.search_top_widget.setVisible(not compact)
+        self.compact_search_btn.setVisible(compact)
+        self.mode.setVisible(not compact)
+        self.search_input.setVisible(not compact and self.mode.currentIndex() == 0)
+        self.image_row_widget.setVisible(not compact and self.mode.currentIndex() == 1)
+        self.filter_row_widget.setVisible(not compact)
+        # Language/region controls were removed; older layouts may not define this row.
+        locale_row = getattr(self, "locale_row_widget", None)
+        if locale_row is not None:
+            locale_row.setVisible(not compact)
+        self.genre_filter_widget.setVisible(not compact and self.mode.currentIndex() == 0)
+        margins = (8, 5, 8, 5) if compact else ((14, 12, 14, 12) if self.width() < 850 else (24, 20, 24, 18))
+        central_layout = self.centralWidget().layout()
+        central_layout.setContentsMargins(*margins)
+        central_layout.setSpacing(5 if compact else (12 if self.width() < 850 else 18))
+        if hasattr(self, "search_panel_layout"):
+            self.search_panel_layout.setContentsMargins(10, 5, 10, 5) if compact else self.search_panel_layout.setContentsMargins(20, 18, 20, 18)
+            self.search_panel_layout.setSpacing(5 if compact else 13)
+        # Animate the compact search panel height for a smooth collapse/expand.
+        panel = self.search_panel
+        if hasattr(self, "_search_panel_anim") and self._search_panel_anim:
+            self._search_panel_anim.stop()
+        from PySide6.QtCore import QPropertyAnimation, QEasingCurve
+        target = 54 if compact else panel.sizeHint().height()
+        panel.setMaximumHeight(16777215 if not compact else max(panel.height(), target))
+        anim = QPropertyAnimation(panel, b"maximumHeight", self)
+        anim.setDuration(280)
+        anim.setStartValue(panel.height())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.OutQuart)
+        if not compact:
+            anim.finished.connect(lambda: panel.setMaximumHeight(16777215))
+        self._search_panel_anim = anim
+        anim.start()
+
     def on_gallery_scroll(self, value):
+        # Collapse surrounding chrome with a short height animation and preserve scroll position.
+        was_compact = getattr(self, "_browse_compact", False)
+        should_compact = value > 35
+        if should_compact != was_compact:
+            bar = self.scroll.verticalScrollBar()
+            self.set_browse_compact(should_compact)
+            bar.setValue(min(value, bar.maximum()))
         if self.loading_more or not self.auto_load_enabled or not self.has_more_pages:
             return
         bar=self.scroll.verticalScrollBar()
@@ -1192,53 +1517,67 @@ class MainWindow(QMainWindow):
     def safe_name(value):
         return "".join(c for c in value if c.isalnum() or c in " -_").strip().replace(" ","_")[:80]
 
-def make_splash():
-    pix=QPixmap(520,300); pix.fill(QColor("#17192a")); painter=QPainter(pix)
-    painter.setRenderHint(QPainter.Antialiasing)
-    painter.setBrush(QColor("#6657e8")); painter.setPen(Qt.NoPen); painter.drawRoundedRect(218,48,84,84,24,24)
-    painter.setPen(QColor("white")); painter.setFont(QFont("Segoe UI",34,QFont.Bold)); painter.drawText(218,110,84,45,Qt.AlignCenter,"✦")
-    painter.setFont(QFont("Segoe UI",25,QFont.Bold)); painter.drawText(0,178,520,42,Qt.AlignCenter,"Thumb Finder")
-    painter.setPen(QColor("#b8bdd0")); painter.setFont(QFont("Segoe UI",10)); painter.drawText(0,214,520,28,Qt.AlignCenter,"Discover. Explore. Get Inspired.")
-    painter.setPen(QColor("#8b80ff")); painter.drawText(0,264,520,20,Qt.AlignCenter,"Loading Thumb Finder  ·  Checking for updates…")
-    painter.end(); return pix
 
 def main():
-    try:
-        log_path = configure_logging()
-    except Exception:
-        log_path = Path.home() / "thumb_finder_startup.log"
-
+    log_path = configure_logging()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     sys.excepthook = handle_unhandled_exception
 
+    # Check the remote live switch and minimum supported version before creating
+    # the main window. A network failure is fail-open inside release_control.py.
+    release_state = evaluate_release(fetch_release_control(), APP_VERSION)
+    if not release_state["allowed"]:
+        message = release_state["message"] or (
+            "Thumb Finder is temporarily unavailable." if not release_state["enabled"]
+            else f"Please update Thumb Finder to version {release_state['minimum_version']} or newer."
+        )
+        QMessageBox.warning(None, "Thumb Finder unavailable", message)
+        if release_state["enabled"]:
+            QDesktopServices.openUrl(QUrl(release_state["release_url"]))
+        return 0
+    if release_state["update_available"]:
+        latest = release_state["latest_version"]
+        message = release_state["message"] or f"Thumb Finder {latest} is available."
+        answer = QMessageBox.question(
+            None, "Update available",
+            f"{message}\n\nInstalled version: {APP_VERSION}\nLatest version: {latest}\n\nOpen the download page?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        if answer == QMessageBox.Yes:
+            QDesktopServices.openUrl(QUrl(release_state["release_url"]))
+
+    def thread_exception_hook(args):
+        logging.critical("Unhandled background-thread exception",
+                         exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = thread_exception_hook
+
     resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     icon_path = resource_root / ("app_icon.ico" if sys.platform == "win32" else "app_icon.icns")
     if not icon_path.exists():
-        icon_path = resource_root / "app_icon.svg"
+        icon_path = Path(__file__).parent / "app_icon.svg"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
-
-    splash = QSplashScreen(make_splash())
-    splash.show()
-    app.processEvents()
 
     try:
         window = MainWindow()
         if not window.run_first_launch_setup():
-            splash.close()
             return 1
-        QTimer.singleShot(0, lambda: window.start_startup_update_check(splash))
+        window.show()
+        logging.info("Thumb Finder %s started in local-debug mode", APP_VERSION)
+        # Delay the first-run prompt until Qt has painted the main window.
+        if not window.api_key:
+            QTimer.singleShot(120, window.prompt_for_api_key)
         return app.exec()
     except Exception as exc:
         logging.exception("Fatal startup error")
-        splash.close()
         QMessageBox.critical(
             None,
             "Thumb Finder could not start",
             f"The application encountered a startup error.\n\n{exc}\n\n"
-            f"Diagnostic log: {log_path}",
+            f"Diagnostic log: {log_path or 'Unavailable'}",
         )
         return 1
 

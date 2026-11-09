@@ -1,55 +1,90 @@
-# Thumb Finder
+# Thumb Finder — Local Debug Version
 
-**Discover. Explore. Get Inspired.**
+Thumb Finder is a PySide6 desktop app for discovering popular long-form movie thumbnails from YouTube. This package is for local source debugging only. It does not build an EXE, contact GitHub Releases, or perform online updates. Version remains **v1.0**.
 
-Thumb Finder is a portable PySide6 desktop application for discovering and saving YouTube video thumbnails. The displayed product version remains **v1.0**; an internal build number allows maintenance updates without changing the displayed version.
+## Run on Windows
 
-## Portable downloads
+1. Extract the project folder somewhere writable.
+2. Install the main app dependencies: `py -m pip install -r requirements.txt`.
+3. Run `Run_Thumb_Finder_Debug.bat` or `py run_app.py`.
+4. Enter your YouTube Data API key when prompted. It is stored in `%USERPROFILE%\.thumb_finder\config.json`.
 
-- **Windows:** download `Thumb-Finder-Windows-Portable.zip`, extract the folder, and run `Thumb-Finder.exe`. No installer or Python installation is required. Keep the extracted folder in a location your Windows account can modify so automatic updates can replace its files.
-- **Intel macOS:** open `Thumb-Finder-macOS-Intel.dmg` and copy `Thumb Finder.app` to a user-writable Applications folder (for example `~/Applications`). The portable app bundle contains its runtime; Python is not required. The matching portable ZIP is used by the in-app updater.
+The launcher does not build an EXE or install AI dependencies.
 
-The app is currently built for Windows x64 and Intel macOS (x86_64). Apple Silicon native builds are disabled for now.
+## Features
 
-## Automatic updates
+- Search by actor name, normal topic, or reference thumbnail image.
+- Movie/Film & Animation category search with a 40-minute minimum by default.
+- Genre keyword filter and view-count ordering of fetched candidates.
+- Auto-load more candidates while scrolling.
+- Light/dark theme; system appearance is the initial default.
+- Save original available YouTube thumbnail files.
+- Thumbnail editor with rectangle selection, resize handles, Auto Adjust, brightness, contrast, saturation, Undo and Save edited copy.
 
-At startup, the app checks the latest public release from `https://github.com/hemantHQ/Thumb-Finder`. If a compatible update is available, choose **Download & update**. The app downloads the correct platform package, verifies its SHA-256 checksum, and asks whether to restart. On confirmation, a separate helper waits for the app to close, replaces the old portable app files, and launches the updated app. If the network is unavailable, the current app continues to start normally.
+## Optional AI object removal
 
-For reliable automatic replacement, keep the portable app in a folder/bundle location writable by your user account. If the app is inside a protected system folder, update replacement may require manual installation from the GitHub release page.
+The main app starts without an AI model or PyTorch. The first time the user clicks **Remove Objects**, Thumb Finder asks permission to install a separate PyTorch/LaMa runtime and download the Big-LaMa model. The model itself is a small download; PyTorch is the larger dependency. Both are cached outside the app and reused.
 
-The update manifest uses an internal build number. The visible version remains **v1.0** until the publisher explicitly changes it.
+- Big-LaMa is used only for object removal. Auto Adjust and Enhance remain separate.
+- A persistent helper process loads the model once per app session and reuses it for subsequent removals.
+- The user's rectangle guides object segmentation; LaMa fills the estimated object mask, not the entire rectangle.
+- No compiler is installed or invoked. If compatible prebuilt PyTorch wheels are unavailable, removal reports an error while the main app remains usable.
+- Images are processed locally and are never uploaded. The original thumbnail is not overwritten.
 
-## API key setup
+See [ON_DEMAND_AI_ENGINE.md](ON_DEMAND_AI_ENGINE.md) for model and cache details.
 
-Users do not enter a YouTube API key. The publisher adds a GitHub Actions repository secret named `YOUTUBE_API_KEY`; release builds inject it into the client application.
+## Logs and settings
 
-**Security warning:** a key embedded in a public desktop application can be extracted. GitHub Secrets protect it during CI, not after distribution. Restrict the key to the YouTube Data API, monitor quota, and rotate it if abused. See `docs/SECURITY.md`.
+- Settings: `%USERPROFILE%\.thumb_finder\config.json`
+- Logs: `%USERPROFILE%\.thumb_finder\logs\thumb_finder.log`
 
-## Build and release
+The YouTube API key is stored in the local config file in plain text. Keep that file private.
 
-Push a matching tag such as `v1.0.0`, or manually run the GitHub Actions workflow for that tag. The workflow builds Windows x64 and Intel macOS packages, generates checksums and an update manifest, and publishes them to the GitHub Release.
+## Limitations
 
-Required repository secret: `YOUTUBE_API_KEY`.
+- YouTube does not expose actual CTR for arbitrary videos. View count is used for popularity ordering.
+- Genre filtering is keyword-based because YouTube does not provide reliable movie-genre metadata for search results.
+- The YouTube API's `videoDuration=long` filter means over 20 minutes; the app separately checks the exact 40-minute minimum after retrieving video details.
+- AI inpainting reconstructs content plausibly; it cannot guarantee perfect recovery of hidden details, especially on complex backgrounds.
 
-## Local developer run (Windows)
+## Important: object-removal engine identity
 
-```powershell
-py -3 -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-$env:THUMB_FINDER_YOUTUBE_API_KEY = "your-development-key"
-python -m thumb_finder.app
+This source package uses **SAM 2.1 + Big-LaMa** for Remove Objects. The runtime worker is `thumb_finder/ai_worker.py`; it does not use Stable Diffusion, Diffusers, or a tokenizer. If a dialog says `Local Stable Diffusion removal failed` or asks for `tokenizer/added_tokens.json`, that dialog is coming from an older running copy of Thumb Finder, not this source package. Close every Thumb Finder process, extract this ZIP into a new folder, and launch `Run_Thumb_Finder_Debug.bat` from that new folder. Do not copy old `thumb_finder` files over this folder.
+
+
+## Automatic GitHub builds (Windows + macOS)
+
+The workflow `.github/workflows/release-build.yml` runs whenever a version tag is pushed.
+It builds three separate downloads:
+
+- Windows x64
+- macOS Intel (x86_64)
+- macOS Apple Silicon (arm64)
+
+To publish a release, push a tag from the repository root:
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
 ```
 
-Never commit a real key.
+GitHub Actions runs the tests, builds all three platforms, and attaches the ZIP files to
+the matching GitHub Release. The version embedded in each build is read from the tag.
+You can also start a test build from the Actions tab using **workflow_dispatch**.
 
-## Current feature baseline
+## One-file remote live switch and version control
 
-- Actor Name and Topic Search.
-- Similar Thumbnail Image search using local visual comparison against a bounded pool of fetched YouTube thumbnails; not internet-wide reverse-image search.
-- Long-form duration filtering, automatic gallery loading, and thumbnail downloads.
-- Startup update checks, checksum verification, portable self-update, and diagnostic logging.
+Edit only `release-control.json` on the GitHub `main` branch:
 
-Diagnostic logs are written to `~/.thumb_finder/logs/thumb_finder.log`.
+- `enabled: true` — app may start.
+- `enabled: false` — app is remotely disabled at next launch.
+- `latest_version` — version to show as available.
+- `minimum_version` — older builds below this version are blocked and sent to the release page.
+- `message` — message shown to users.
+- `release_url` — page opened for update/blocked versions.
 
-The footer displays `Thumb Finder v1.0 - Hemant`.
+The app fetches this file at startup. If GitHub is unreachable, it fails open and lets the
+app start; a network outage therefore does not accidentally disable the app. The check uses
+a short timeout. This is an availability/version switch, not DRM or a tamper-proof security
+boundary: users can bypass it in a modified local build. Changes to the JSON file do not
+require a new app build.
