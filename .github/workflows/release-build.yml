@@ -10,8 +10,30 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Validate source
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+      - name: Run tests with full diagnostics
+        run: python -X utf8 -m pytest -vv --tb=long
+
   build:
     name: Build ${{ matrix.name }}
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -28,46 +50,40 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     env:
-      PYTHONUTF8: '1'
-      PYTHONIOENCODING: 'utf-8'
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v5
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-
-      - name: Set version from Git tag
+      - name: Set version from release tag
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          python - "$VERSION" <<'PY'
-          import pathlib, sys
-          version = sys.argv[1]
-          path = pathlib.Path("thumb_finder/version.py")
-          path.write_text(
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          python - "$TAG_VERSION" <<'PY'
+          import pathlib, re, sys
+          tag_version = sys.argv[1]
+          if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", tag_version):
+              raise SystemExit(f"Invalid release tag version: {tag_version}. Use v1.0 or v1.0.1.")
+          # Accept tags such as v1.0; Python packaging uses normalized 1.0.0.
+          version = tag_version if tag_version.count(".") == 2 else tag_version + ".0"
+          pathlib.Path("thumb_finder/version.py").write_text(
               '"""Single source of truth for the application version."""\n'
-              f'__version__ = "{version}"\n',
-              encoding="utf-8"
+              f'__version__ = "{version}"\n', encoding="utf-8"
           )
           pyproject = pathlib.Path("pyproject.toml")
           text = pyproject.read_text(encoding="utf-8")
-          import re
           text = re.sub(r'(?m)^version = "[^"]+"$', f'version = "{version}"', text, count=1)
           pyproject.write_text(text, encoding="utf-8")
           PY
-
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller pytest
-
-      - name: Run tests
-        run: python -m pytest -q
-
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
       - name: Build Windows app
         if: runner.os == 'Windows'
         shell: pwsh
@@ -79,33 +95,28 @@ jobs:
             --add-data "thumb_finder/app_icon.svg;." `
             --add-data "thumb_finder/logo.svg;thumb_finder" `
             run_app.py
+          if (!(Test-Path "dist/ThumbFinder/ThumbFinder.exe")) { throw "PyInstaller did not create ThumbFinder.exe" }
           Compress-Archive -Path dist/ThumbFinder -DestinationPath "ThumbFinder-${{ github.ref_name }}-${{ matrix.artifact }}.zip"
-
-      - name: Prepare macOS application icon
+      - name: Prepare macOS icon
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p build/ThumbFinder.iconset
           for size in 16 32 128 256 512; do
-            sips -z "$size" "$size" thumb_finder/app_icon.png \
-              --out "build/ThumbFinder.iconset/icon_${size}x${size}.png" >/dev/null
-            if [ "$size" -le 512 ]; then
-              double=$((size * 2))
-              sips -z "$double" "$double" thumb_finder/app_icon.png \
-                --out "build/ThumbFinder.iconset/icon_${size}x${size}@2x.png" >/dev/null
-            fi
+            sips -z "$size" "$size" thumb_finder/app_icon.png --out "build/ThumbFinder.iconset/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" thumb_finder/app_icon.png --out "build/ThumbFinder.iconset/icon_${size}x${size}@2x.png" >/dev/null
           done
           iconutil -c icns build/ThumbFinder.iconset -o thumb_finder/app_icon.icns
           test -s thumb_finder/app_icon.icns
-
       - name: Build macOS app
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           ARCH="$(uname -m)"
-          echo "Building Thumb Finder for macOS architecture: ${ARCH}"
+          echo "Runner architecture: ${ARCH}"
           pyinstaller --noconfirm --clean --windowed --name ThumbFinder \
             --target-architecture "${ARCH}" \
             --osx-bundle-identifier "com.hemantHQ.thumbfinder" \
@@ -117,9 +128,7 @@ jobs:
             run_app.py
           test -d dist/ThumbFinder.app
           test -f dist/ThumbFinder.app/Contents/Info.plist
-          ditto -c -k --sequesterRsrc --keepParent dist/ThumbFinder.app \
-            "ThumbFinder-${GITHUB_REF_NAME}-${{ matrix.artifact }}.zip"
-
+          ditto -c -k --sequesterRsrc --keepParent dist/ThumbFinder.app "ThumbFinder-${GITHUB_REF_NAME}-${{ matrix.artifact }}.zip"
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -127,7 +136,6 @@ jobs:
           path: ThumbFinder-${{ github.ref_name }}-${{ matrix.artifact }}.zip
           if-no-files-found: error
           retention-days: 14
-
       - name: Attach build to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2

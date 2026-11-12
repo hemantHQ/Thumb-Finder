@@ -988,7 +988,7 @@ class MainWindow(QMainWindow):
         footer_text.setObjectName("FooterLabel")
         footer.addWidget(footer_text)
         footer.addStretch()
-        signature = QLabel("Thumb Finder v1.0 - Hemant")
+        signature = QLabel("Thumb Finder v1.0")
         signature.setObjectName("FooterSignature")
         footer.addWidget(signature)
         root.addWidget(self.footer_widget)
