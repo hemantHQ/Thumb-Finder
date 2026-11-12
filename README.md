@@ -88,3 +88,16 @@ app start; a network outage therefore does not accidentally disable the app. The
 a short timeout. This is an availability/version switch, not DRM or a tamper-proof security
 boundary: users can bypass it in a modified local build. Changes to the JSON file do not
 require a new app build.
+
+
+## Desktop application icons
+
+The source includes `thumb_finder/app_icon.png` and `thumb_finder/app_icon.ico`.
+The Windows build embeds the ICO in the executable and bundles it for the app window.
+The macOS workflow generates `thumb_finder/app_icon.icns` from the PNG on the runner,
+then embeds it in the `.app` bundle and in the Qt runtime resources. No local macOS
+icon-generation tools are required.
+
+The macOS app is not code-signed or notarized by this workflow. macOS may show an
+"unidentified developer" warning on first launch; users can Control-click the app and
+choose Open. Developer ID signing and notarization require Apple credentials/secrets.

@@ -73,20 +73,50 @@ jobs:
         shell: pwsh
         run: |
           pyinstaller --noconfirm --clean --windowed --name ThumbFinder `
+            --icon "thumb_finder/app_icon.ico" `
             --collect-all PySide6 --collect-all cv2 `
-            --add-data "thumb_finder/app_icon.svg;thumb_finder" `
+            --add-data "thumb_finder/app_icon.ico;." `
+            --add-data "thumb_finder/app_icon.svg;." `
             --add-data "thumb_finder/logo.svg;thumb_finder" `
             run_app.py
-          Compress-Archive -Path dist/ThumbFinder -DestinationPath ThumbFinder-${{ github.ref_name }}-${{ matrix.artifact }}.zip
+          Compress-Archive -Path dist/ThumbFinder -DestinationPath "ThumbFinder-${{ github.ref_name }}-${{ matrix.artifact }}.zip"
+
+      - name: Prepare macOS application icon
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/ThumbFinder.iconset
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" thumb_finder/app_icon.png \
+              --out "build/ThumbFinder.iconset/icon_${size}x${size}.png" >/dev/null
+            if [ "$size" -le 512 ]; then
+              double=$((size * 2))
+              sips -z "$double" "$double" thumb_finder/app_icon.png \
+                --out "build/ThumbFinder.iconset/icon_${size}x${size}@2x.png" >/dev/null
+            fi
+          done
+          iconutil -c icns build/ThumbFinder.iconset -o thumb_finder/app_icon.icns
+          test -s thumb_finder/app_icon.icns
 
       - name: Build macOS app
         if: runner.os == 'macOS'
+        shell: bash
         run: |
+          set -euo pipefail
+          ARCH="$(uname -m)"
+          echo "Building Thumb Finder for macOS architecture: ${ARCH}"
           pyinstaller --noconfirm --clean --windowed --name ThumbFinder \
+            --target-architecture "${ARCH}" \
+            --osx-bundle-identifier "com.hemantHQ.thumbfinder" \
+            --icon "thumb_finder/app_icon.icns" \
             --collect-all PySide6 --collect-all cv2 \
-            --add-data "thumb_finder/app_icon.svg:thumb_finder" \
+            --add-data "thumb_finder/app_icon.icns:." \
+            --add-data "thumb_finder/app_icon.svg:." \
             --add-data "thumb_finder/logo.svg:thumb_finder" \
             run_app.py
+          test -d dist/ThumbFinder.app
+          test -f dist/ThumbFinder.app/Contents/Info.plist
           ditto -c -k --sequesterRsrc --keepParent dist/ThumbFinder.app \
             "ThumbFinder-${GITHUB_REF_NAME}-${{ matrix.artifact }}.zip"
 
