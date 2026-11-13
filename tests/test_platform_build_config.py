@@ -17,3 +17,9 @@ def test_platform_icon_assets_are_present():
     assert (root / "app_icon.svg").is_file()
     assert (root / "app_icon.png").is_file()
     assert (root / "app_icon.ico").is_file()
+
+
+def test_windows_icon_is_not_gitignored():
+    root = Path(__file__).parents[1]
+    gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+    assert "thumb_finder/app_icon.ico\n" not in gitignore

@@ -39,5 +39,5 @@ output/
 thumb_finder/api_config.py
 
 # Generated platform icons and injected release config
-thumb_finder/app_icon.ico
+# Keep app_icon.ico tracked: GitHub Actions source validation and Windows builds require it.
 thumb_finder/app_icon.icns
