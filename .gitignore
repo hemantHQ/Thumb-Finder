@@ -1,43 +1,7 @@
-# Python
 __pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
+*.pyc
 .venv/
-venv/
-.env
-.env.*
-!.env.example
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Build outputs
+thumb_finder/_build_keys.py
 build/
-build_icons/
 dist/
 *.spec
-*.egg-info/
-
-# IDE / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Local app data / user files
-*.log
-*.tmp
-downloads/
-output/
-
-# Generated release configuration (never commit real credentials)
-thumb_finder/api_config.py
-
-# Generated platform icons and injected release config
-# Keep app_icon.ico tracked: GitHub Actions source validation and Windows builds require it.
-thumb_finder/app_icon.icns

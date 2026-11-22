@@ -1,103 +1,79 @@
-# Thumb Finder — Local Debug Version
+# Thumb Finder v1.0
 
-Thumb Finder is a PySide6 desktop app for discovering popular long-form movie thumbnails from YouTube. This package is for local source debugging only. It does not build an EXE, contact GitHub Releases, or perform online updates. Version remains **v1.0**.
+A PySide6 desktop studio for finding movie thumbnails and preparing three distinct YouTube A/B/C candidates.
 
-## Run on Windows
+## Run from source
 
-1. Extract the project folder somewhere writable.
-2. Install the main app dependencies: `py -m pip install -r requirements.txt`.
-3. Run `Run_Thumb_Finder_Debug.bat` or `py run_app.py`.
-4. Enter your YouTube Data API key when prompted. It is stored in `%USERPROFILE%\.thumb_finder\config.json`.
+Install Python 3.12 or 3.13, then run:
 
-The launcher does not build an EXE or install AI dependencies.
-
-## Features
-
-- Search by actor name, normal topic, or reference thumbnail image.
-- Movie/Film & Animation category search with a 40-minute minimum by default.
-- Genre keyword filter and view-count ordering of fetched candidates.
-- Auto-load more candidates while scrolling.
-- Light/dark theme; system appearance is the initial default.
-- Save original available YouTube thumbnail files.
-- Thumbnail editor with rectangle selection, resize handles, Auto Adjust, brightness, contrast, saturation, Undo and Save edited copy.
-
-## Optional AI object removal
-
-The main app starts without an AI model or PyTorch. The first time the user clicks **Remove Objects**, Thumb Finder asks permission to install a separate PyTorch/LaMa runtime and download the Big-LaMa model. The model itself is a small download; PyTorch is the larger dependency. Both are cached outside the app and reused.
-
-- Big-LaMa is used only for object removal. Auto Adjust and Enhance remain separate.
-- A persistent helper process loads the model once per app session and reuses it for subsequent removals.
-- The user's rectangle guides object segmentation; LaMa fills the estimated object mask, not the entire rectangle.
-- No compiler is installed or invoked. If compatible prebuilt PyTorch wheels are unavailable, removal reports an error while the main app remains usable.
-- Images are processed locally and are never uploaded. The original thumbnail is not overwritten.
-
-See [ON_DEMAND_AI_ENGINE.md](ON_DEMAND_AI_ENGINE.md) for model and cache details.
-
-## Logs and settings
-
-- Settings: `%USERPROFILE%\.thumb_finder\config.json`
-- Logs: `%USERPROFILE%\.thumb_finder\logs\thumb_finder.log`
-
-The YouTube API key is stored in the local config file in plain text. Keep that file private.
-
-## Limitations
-
-- YouTube does not expose actual CTR for arbitrary videos. View count is used for popularity ordering.
-- Genre filtering is keyword-based because YouTube does not provide reliable movie-genre metadata for search results.
-- The YouTube API's `videoDuration=long` filter means over 20 minutes; the app separately checks the exact 40-minute minimum after retrieving video details.
-- AI inpainting reconstructs content plausibly; it cannot guarantee perfect recovery of hidden details, especially on complex backgrounds.
-
-## Important: object-removal engine identity
-
-This source package uses **SAM 2.1 + Big-LaMa** for Remove Objects. The runtime worker is `thumb_finder/ai_worker.py`; it does not use Stable Diffusion, Diffusers, or a tokenizer. If a dialog says `Local Stable Diffusion removal failed` or asks for `tokenizer/added_tokens.json`, that dialog is coming from an older running copy of Thumb Finder, not this source package. Close every Thumb Finder process, extract this ZIP into a new folder, and launch `Run_Thumb_Finder_Debug.bat` from that new folder. Do not copy old `thumb_finder` files over this folder.
-
-
-## Automatic GitHub builds (Windows + macOS)
-
-The workflow `.github/workflows/release-build.yml` runs whenever a version tag is pushed.
-It builds three separate downloads:
-
-- Windows x64
-- macOS Intel (x86_64)
-- macOS Apple Silicon (arm64)
-
-To publish a release, push a tag from the repository root:
-
-```bash
-git tag v1.0.1
-git push origin v1.0.1
+```sh
+python -m pip install -r requirements.txt
+python run_app.py
 ```
 
-GitHub Actions runs the tests, builds all three platforms, and attaches the ZIP files to
-the matching GitHub Release. The version embedded in each build is read from the tag.
-You can also start a test build from the Actions tab using **workflow_dispatch**.
+On Windows, double-click **Run_Thumb_Finder_Debug.bat** after installing dependencies. The launcher uses a local `.venv` if present.
 
-## One-file remote live switch and version control
+## Search and edit
 
-Edit only `release-control.json` on the GitHub `main` branch:
+1. In **Settings**, add a project key with YouTube Data API v3 enabled. You may supply a second key for quota failover. Environment variables `YOUTUBE_API_KEY_1` and `YOUTUBE_API_KEY_2` also work.
+2. Search for a movie or actor or paste a YouTube video URL. Category adds a query keyword. Discovery uses a 40-minute minimum in the background and direct URLs accept any duration. A reference image ranks the fetched results by visual similarity.
+3. Use **Save** to keep the highest available source or **Edit** to send it to A, B or C. The studio also accepts local files and works offline.
+4. Adjust each candidate independently. Crop, tone, optional text and JPEG quality are per candidate. Use **Small preview** to check readability and **Before adjustments** to compare the current crop.
+5. Use **Download A**, **Download B**, or **Download C** to save the active candidate as a JPG. For a full set, enter a movie name and select **Export A/B/C** to create a unique run directory with three JPGs and a CSV manifest. Candidates export at 1280 × 720 by default or 1920 × 1080 after Enhance.
 
-- `enabled: true` — app may start.
-- `enabled: false` — app is remotely disabled at next launch.
-- `latest_version` — version to show as available.
-- `minimum_version` — older builds below this version are blocked and sent to the release page.
-- `message` — message shown to users.
-- `release_url` — page opened for update/blocked versions.
+## Optional offline editing
 
-The app fetches this file at startup. If GitHub is unreachable, it fails open and lets the
-app start; a network outage therefore does not accidentally disable the app. The check uses
-a short timeout. This is an availability/version switch, not DRM or a tamper-proof security
-boundary: users can bypass it in a modified local build. Changes to the JSON file do not
-require a new app build.
+**Auto Adjust** runs in Thumb Finder and balances exposure, shadows, highlights and color. Inspect the result with **Before adjustments** and fine-tune it with the sliders.
 
+1. In **Remove**, choose **Rectangle** or **Brush**. On first use approve the **LaMa** download (about 208 MB). Mark the object or text, review the purple mask, and choose **Apply removal**. Combine brush and rectangle marks as needed. **Undo mark** and **Clear** change the mask before applying. **Undo** reverts an applied removal.
+2. Select **Enhance** and approve the **Real-ESRGAN** download (about 68 MB) on first use. The app then enhances the selected candidate to 1920 × 1080.
 
-## Desktop application icons
+The first model also installs the shared ONNX Runtime engine. Thumb Finder handles setup in the background and caches the engine and each model in its local app data. Subsequent edits run offline on your computer, and your images stay on the device. The packaged runtime targets Apple Silicon with macOS 14 or later. Windows source launches reuse the Python installation that started Thumb Finder.
 
-The source includes `thumb_finder/app_icon.png` and `thumb_finder/app_icon.ico`.
-The Windows build embeds the ICO in the executable and bundles it for the app window.
-The macOS workflow generates `thumb_finder/app_icon.icns` from the PNG on the runner,
-then embeds it in the `.app` bundle and in the Qt runtime resources. No local macOS
-icon-generation tools are required.
+Set the crop before running local AI. The edits remain reversible, and **Manual adjustments** opens the sliders and text controls. Undo or reset the AI edit to change its crop. Model sources: [LaMa ONNX](https://huggingface.co/Carve/LaMa-ONNX) and [Real-ESRGAN ONNX](https://huggingface.co/SceneWorks/real-esrgan-onnx).
 
-The macOS app is not code-signed or notarized by this workflow. macOS may show an
-"unidentified developer" warning on first launch; users can Control-click the app and
-choose Open. Developer ID signing and notarization require Apple credentials/secrets.
+## Create online with Cloudflare
+
+1. Use a Cloudflare **Workers Free** account and create a Workers AI API token. In Thumb Finder **Settings**, enter the Cloudflare account ID and token. You can also supply the token through the `CLOUDFLARE_API_TOKEN` environment variable.
+2. In **Create**, leave **Cloudflare · Online** selected and enter a prompt. This option sends the prompt to Cloudflare and uses FLUX.1 Schnell with four generation steps.
+3. Each draft appears and is saved as it finishes. **Stop after current** ends a three-concept batch after its current image. Use **Draft history** to reopen saved batches and **Reuse prompt** to make another variation. Each draft has a 16:9 preview and **Send to Edit** for A, B, or C. The full generated image remains available when adjusting its crop in Edit.
+
+Cloudflare shares its 10,000 daily free Neurons across Workers AI usage on the account. Image size and generation steps affect usage, so the number of images available varies. A free plan stops requests when its free allocation runs out. [Cloudflare setup](https://developers.cloudflare.com/workers-ai/get-started/rest-api/) · [Cloudflare pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+
+## Optional local Create with reference images
+
+Create uses the Apache 2.0 FLUX.2 Klein 4B model through a separately installed ComfyUI. There is no generation API key, credit balance, or per-image fee. Your computer or your studio's own ComfyUI server supplies the compute. Search still uses a separate YouTube Data API key.
+
+1. Install or update [ComfyUI](https://www.comfy.org/download). In the [FLUX.2 Klein setup guide](https://docs.comfy.org/tutorials/flux/flux-2-klein), use the **distilled 4B** model files. Put them in these folders under ComfyUI:
+   - `models/diffusion_models/flux-2-klein-4b-fp8.safetensors`
+   - `models/text_encoders/qwen_3_4b.safetensors`
+   - `models/vae/flux2-vae.safetensors`
+2. Start ComfyUI. Thumb Finder defaults to `http://127.0.0.1:8188`. If ComfyUI displays a different local port, enter its address in **Settings → ComfyUI server**. A studio-hosted endpoint can use HTTPS.
+3. In **Create**, choose **ComfyUI · Local** and enter a prompt. You can add a composition or cast reference, or both. Choose **1 draft** or **3 concepts** and click **Generate**. The three-concept mode queues a close-up, confrontation, and wide action shot.
+4. Choose an A/B/C destination on a draft and use **Send to Edit**. Local drafts render at 1024 × 576.
+
+The model files and ComfyUI runtime are separate downloads and stay installed across Thumb Finder updates. Generation speed and compatibility depend on the ComfyUI machine, especially available GPU memory. Reference files are transferred to the ComfyUI server and stored in its input folder.
+
+## Apple Silicon packaging
+
+One arm64 build targets both Mac mini M4 and M6. The workflow builds on a macOS 15 arm64 runner, signs the bundle ad hoc through PyInstaller, and includes the Thumb Finder icon in Finder and the Dock. Before uploading, it extracts the resulting ZIP, checks the executable architecture, validates the code signature and icon, and opens the packaged app through the native Qt macOS platform to check startup and preview rendering.
+
+### Publish using GitHub Desktop
+
+1. In GitHub Desktop, open your existing local `hemantHQ/Thumb-Finder` repository or use **File → Clone repository**. Copy the contents of the extracted source folder into the clone, including `.github`.
+2. Review **Changes**, commit to the intended branch, and click **Push origin**. If you are working on a separate branch, merge it into the default branch before running the workflow from the Actions page.
+3. In the browser, go to **Actions → Build Thumb Finder for Apple Silicon → Run workflow**. Open the successful run and download the artifact. Extract its outer archive and keep the inner `Thumb-Finder-v1.0-macOS-arm64.zip`.
+4. Install and test the exact inner ZIP on each Mac you list as tested. Once verified, attach it to a GitHub release. The workflow can also run when a new `v1.0` tag is pushed.
+
+### Install on a Mac
+
+Extract the ZIP, drag **Thumb Finder.app** into **Applications**, and open it there. Ad-hoc signing allows the native Apple Silicon code to load. Apple Gatekeeper can still show a first-launch warning for an unnotarized download. If you trust and have verified this build, try opening it once and use **System Settings → Privacy & Security → Open Anyway** if Apple offers it. If the app actually launches and then quits unexpectedly, save the macOS crash report so the startup failure can be diagnosed. [Apple's app-opening guidance](https://support.apple.com/en-us/102445)
+
+Build-time API keys are optional and can be recovered from a distributed bundle. Use local keys for distribution to other users. GitHub's update check opens Releases for manual installation.
+
+## Checks
+
+```sh
+python -m compileall -q run_app.py thumb_finder tests
+python -m unittest discover -s tests
+```

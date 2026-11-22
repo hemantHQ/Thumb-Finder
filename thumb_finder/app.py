@@ -1,1585 +1,1583 @@
-import os, sys, json, requests, logging, re, threading, tempfile
+from collections import OrderedDict
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
-from .utils import parse_youtube_duration
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QUrl, QSize, QTimer, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QPixmap, QDesktopServices, QIcon
-from PySide6.QtWidgets import QGraphicsOpacityEffect
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QLineEdit, QComboBox, QSpinBox, QFrame, QScrollArea,
-    QGridLayout, QFileDialog, QMessageBox, QProgressBar, QDialog, QSplitter, QSizePolicy,
-    QFormLayout, QDialogButtonBox, QCheckBox, QInputDialog
-)
+from threading import Event
+import os
 
-# OpenCV and NumPy are intentionally lazy-loaded. Normal startup/search should not
-# pay their import cost; they are needed only for similar-thumbnail image search.
-cv2 = None
-np = None
-CV_AVAILABLE = None
+import requests
+from PIL import Image, ImageOps
+from PySide6.QtCore import (QEasingCurve, QObject, QPoint, QRect, QRunnable, QSettings,
+                            QSize, QStandardPaths, Qt, QThreadPool, QTimer, QUrl, QVariantAnimation, Signal)
+from PySide6.QtGui import (QColor, QDesktopServices, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon)
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QFileDialog, QFormLayout, QFrame, QGraphicsOpacityEffect,
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+                               QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+                               QStackedWidget, QVBoxLayout, QWidget)
 
-def ensure_cv_available():
-    global cv2, np, CV_AVAILABLE
-    if CV_AVAILABLE is True:
-        return True
-    if CV_AVAILABLE is False:
-        return False
-    try:
-        import cv2 as _cv2
-        import numpy as _np
-        cv2, np = _cv2, _np
-        CV_AVAILABLE = True
-        logging.info("OpenCV image-search dependencies loaded on demand")
-        return True
-    except Exception:
-        CV_AVAILABLE = False
-        logging.exception("Could not load OpenCV/NumPy for similar-image search")
-        return False
+from . import VERSION
+from . import comfy, offline, services, studio
+from .youtube import REPOSITORY, YouTube, distance, signature, thumbnail, video_id
 
-try:
-    from .version import __version__
-except ImportError:
-    try:
-        from thumb_finder.version import __version__
-    except ImportError:
-        from version import __version__
-
-APP_NAME = "Thumb Finder"
-APP_VERSION = __version__
-
-from .release_control import fetch_release_control, evaluate_release
-
-
-
-def load_youtube_api_key():
-    """Load an optional developer-provided environment key; otherwise ask at runtime."""
-    return os.environ.get("THUMB_FINDER_YOUTUBE_API_KEY", "").strip()
-
-
-LOG_PATH = None
-
-
-def configure_logging():
-    """Configure rotating diagnostics in a writable user/temp directory."""
-    global LOG_PATH
-    candidates = [Path.home() / ".thumb_finder" / "logs",
-                  Path(os.environ.get("TEMP", "/tmp")) / "ThumbFinder" / "logs"]
-    for directory in candidates:
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-            log_path = directory / "thumb_finder.log"
-            from logging.handlers import RotatingFileHandler
-            root = logging.getLogger()
-            root.setLevel(logging.INFO)
-            if not any(getattr(h, "baseFilename", None) == str(log_path) for h in root.handlers):
-                handler = RotatingFileHandler(log_path, maxBytes=2_000_000,
-                                              backupCount=3, encoding="utf-8")
-                handler.setFormatter(logging.Formatter(
-                    "%(asctime)s %(levelname)s %(threadName)s %(message)s"))
-                root.addHandler(handler)
-            LOG_PATH = log_path
-            return log_path
-        except Exception:
-            continue
-    logging.basicConfig(level=logging.INFO)
-    LOG_PATH = None
-    return None
-
-
-def handle_unhandled_exception(exc_type, exc_value, exc_tb):
-    """Log unexpected crashes and show a useful message instead of failing silently."""
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
-        return
-    logging.critical(
-        "Unhandled application exception",
-        exc_info=(exc_type, exc_value, exc_tb),
-    )
-    app = QApplication.instance()
-    if app is not None:
-        try:
-            QMessageBox.critical(
-                None,
-                "Thumb Finder encountered an error",
-                "An unexpected error occurred. Diagnostic details were written to the log when possible.\n\n"
-                f"Error: {exc_value}\n\n"
-                f"Log file: {LOG_PATH or 'Unavailable (see console output)'}",
-            )
-        except Exception:
-            logging.exception("Could not display the unexpected-error dialog")
-
-CONFIG_PATH = Path.home() / ".thumb_finder" / "config.json"
-DOWNLOAD_ROOT = Path.home() / "Pictures" / "Thumb Finder"
-BATCH_SIZE = 20  # Results are loaded automatically as the gallery is scrolled.
-
-# Compact search bar used while browsing the gallery.
-DARK = """
-QWidget { background:#10111b; color:#f4f3fb; font-family:'Segoe UI'; font-size:10pt; }
-QMainWindow { background:#10111b; }
-QFrame#Sidebar { background:#171827; border:1px solid #292a40; border-radius:20px; }
-QFrame#Panel { background:#171827; border:1px solid #292a40; border-radius:18px; }
-QFrame#Card { background:#191b2b; border:1px solid #2c2e45; border-radius:16px; }
-QFrame#Card:hover { border:1px solid #7569ef; background:#1c1e30; }
-QLabel#Muted { color:#9a9bb4; }
-QLabel#Eyebrow { color:#9b91ff; font-size:8pt; font-weight:800; letter-spacing:1px; }
-QLabel#PageTitle { font-size:23pt; font-weight:800; color:#faf9ff; }
-QLabel#SectionTitle { font-size:12pt; font-weight:750; }
-QLabel#Metric { font-size:17pt; font-weight:800; color:#fff; }
-QLineEdit, QComboBox, QSpinBox { background:#202238; border:1px solid #343650; border-radius:11px; padding:12px 13px; color:#f7f6ff; selection-background-color:#6657e8; min-height:20px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border:1px solid #8b80ff; background:#242640; }
-QComboBox::drop-down { border:0; width:28px; }
-QComboBox QAbstractItemView { background:#202238; color:#f7f6ff; border:1px solid #414363; selection-background-color:#6657e8; padding:6px; }
-QPushButton { background:#6657e8; color:white; border:0; border-radius:11px; padding:11px 15px; font-weight:700; }
-QPushButton:hover { background:#796cf2; }
-QPushButton:pressed { background:#5143c5; }
-QPushButton:disabled { background:#39384f; color:#77788f; }
-QPushButton#Secondary { background:#282a40; border:1px solid #393b56; color:#e8e6fa; }
-QPushButton#Secondary:hover { background:#333550; border-color:#5d5a8b; }
-QPushButton#Ghost { background:transparent; border:1px solid #393b56; color:#d8d6ec; }
-QPushButton#Ghost:hover { background:#24263a; }
-QPushButton#SmallAction { padding:8px 10px; font-size:9pt; }
-QScrollArea { border:0; background:transparent; }
-QScrollBar:vertical { background:transparent; width:9px; margin:4px 1px; }
-QScrollBar::handle:vertical { background:#41435e; border-radius:4px; min-height:28px; }
-QScrollBar::handle:vertical:hover { background:#7067c6; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
-QProgressBar { border:0; border-radius:4px; background:#2b2d43; height:7px; text-align:center; }
-QProgressBar::chunk { background:#8b80ff; border-radius:4px; }
-QCheckBox { spacing:8px; }
-QCheckBox::indicator { width:17px; height:17px; }
-QPushButton#ThemeToggle { min-width:94px; padding:9px 10px; border-radius:12px; font-weight:750; }
-QPushButton#ThemeToggle { background:#282a40; color:#f4f3fb; border:1px solid #454762; }
-QPushButton#ThemeToggle:hover { background:#353752; }
-QPushButton#CompactSearch { background:#20243a; color:#f5f4ff; border:1px solid #363b58; border-radius:12px; font-weight:700; }
-QDialog { background:#171827; }
-QDialogButtonBox QPushButton { min-width:95px; }
-
-QWidget#AppCanvas { background:#0d0f18; }
-QLabel#BrandTitle { font-size:18pt; font-weight:850; color:#f8f7ff; background:transparent; }
-QLabel#BrandSubtitle { font-size:7.5pt; letter-spacing:1.5px; font-weight:800; color:#8884b6; background:transparent; }
-QLabel#HeroTitle { font-size:25pt; font-weight:850; color:#fbfaff; background:transparent; }
-QLabel#HeroSubtitle { color:#a3a4ba; font-size:10pt; background:transparent; }
-QLabel#DurationChip { background:#24213d; border:1px solid #49416f; color:#bdb4ff; border-radius:10px; padding:6px 12px; font-weight:800; font-size:8.5pt; }
-QFrame#SearchPanel { background:#171a29; border:1px solid #2b2e45; border-radius:20px; }
-QLabel#PanelEyebrow { color:#9d94ff; font-size:8pt; font-weight:850; letter-spacing:1.2px; background:transparent; }
-QComboBox#ModeSelector, QComboBox#GenreSelector, QLineEdit#SearchInput { background:#20243a; color:#f5f4ff; border:1px solid #363b58; border-radius:12px; padding:11px 14px; }
-QComboBox#ModeSelector:focus, QComboBox#GenreSelector:focus, QLineEdit#SearchInput:focus { border:1px solid #8175f2; }
-QLabel#ImageDropZone { background:#20243a; color:#a7a8bf; border:1px dashed #575b7a; border-radius:13px; padding:10px; }
-QPushButton#PrimarySearch { background:#705ff0; color:#fff; border:0; border-radius:12px; padding:12px 18px; font-weight:850; }
-QPushButton#PrimarySearch:hover { background:#8173ff; }
-QPushButton#ToolbarButton { background:#22263b; color:#e9e8fa; border:1px solid #3a3e5b; border-radius:12px; padding:10px 14px; font-weight:750; }
-QPushButton#ToolbarButton:hover { background:#2e3350; border-color:#6962a7; }
-QPushButton#ThemeToggle { min-width:44px; max-width:44px; min-height:44px; max-height:44px; padding:0; border-radius:12px; background:#22263b; color:#f7f4ff; border:1px solid #3a3e5b; font-size:17pt; }
-QLabel#SectionHeading { font-size:17pt; font-weight:850; color:#f8f7ff; background:transparent; }
-QFrame#StatusPanel { background:#171a29; border:1px solid #2b2e45; border-radius:13px; }
-QWidget#GalleryCanvas { background:transparent; }
-QLabel#FooterLabel { color:#817fa1; font-size:7.5pt; font-weight:800; letter-spacing:1px; background:transparent; }
-QLabel#FooterSignature { color:#9b9cb2; font-size:8pt; font-weight:700; background:transparent; }
-"""
-LIGHT = """
-QWidget { background:#f5f6fc; color:#22243a; font-family:'Segoe UI'; font-size:10pt; }
-QMainWindow { background:#f5f6fc; }
-QFrame#Sidebar { background:#ffffff; border:1px solid #e4e6f1; border-radius:20px; }
-QFrame#Panel { background:#ffffff; border:1px solid #e4e6f1; border-radius:18px; }
-QFrame#Card { background:#ffffff; border:1px solid #e5e7f0; border-radius:16px; }
-QFrame#Card:hover { border:1px solid #938af0; background:#fdfdff; }
-QLabel#Muted { color:#777b92; }
-QLabel#Eyebrow { color:#6657d9; font-size:8pt; font-weight:800; letter-spacing:1px; }
-QLabel#PageTitle { font-size:23pt; font-weight:800; color:#202238; }
-QLabel#SectionTitle { font-size:12pt; font-weight:750; }
-QLabel#Metric { font-size:17pt; font-weight:800; color:#22243a; }
-QLineEdit, QComboBox, QSpinBox { background:#fafaff; border:1px solid #dfe1ed; border-radius:11px; padding:12px 13px; color:#252740; min-height:20px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border:1px solid #8175eb; background:#fff; }
-QComboBox::drop-down { border:0; width:28px; }
-QComboBox QAbstractItemView { background:white; color:#252740; border:1px solid #dfe1ed; selection-background-color:#e9e6ff; padding:6px; }
-QPushButton { background:#6657e8; color:white; border:0; border-radius:11px; padding:11px 15px; font-weight:700; }
-QPushButton:hover { background:#796cf2; }
-QPushButton:pressed { background:#5143c5; }
-QPushButton:disabled { background:#d4d1ed; color:#fff; }
-QPushButton#Secondary { background:#f0effa; border:1px solid #e2e0f2; color:#393653; }
-QPushButton#Secondary:hover { background:#e8e6f8; border-color:#c9c4ed; }
-QPushButton#Ghost { background:transparent; border:1px solid #dedfed; color:#53566d; }
-QPushButton#Ghost:hover { background:#f0f0f8; }
-QPushButton#SmallAction { padding:8px 10px; font-size:9pt; }
-QScrollArea { border:0; background:transparent; }
-QScrollBar:vertical { background:transparent; width:9px; margin:4px 1px; }
-QScrollBar::handle:vertical { background:#d1d3e2; border-radius:4px; min-height:28px; }
-QScrollBar::handle:vertical:hover { background:#aaa4e5; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
-QProgressBar { border:0; border-radius:4px; background:#e6e7f0; height:7px; text-align:center; }
-QProgressBar::chunk { background:#6657e8; border-radius:4px; }
-QCheckBox { spacing:8px; }
-QCheckBox::indicator { width:17px; height:17px; }
-QPushButton#ThemeToggle { background:#ffffff; color:#393653; border:1px solid #dfe1ed; }
-QPushButton#ThemeToggle:hover { background:#f0effa; }
-QPushButton#CompactSearch { background:#f9f9fe; color:#25243d; border:1px solid #dfe1ed; border-radius:12px; font-weight:700; }
-QDialog { background:#fff; }
-QDialogButtonBox QPushButton { min-width:95px; }
-
-QWidget#AppCanvas { background:#f4f5fb; }
-QLabel#BrandTitle { font-size:18pt; font-weight:850; color:#25243b; background:transparent; }
-QLabel#BrandSubtitle { font-size:7.5pt; letter-spacing:1.5px; font-weight:800; color:#77739c; background:transparent; }
-QLabel#HeroTitle { font-size:25pt; font-weight:850; color:#22223a; background:transparent; }
-QLabel#HeroSubtitle { color:#686b82; font-size:10pt; background:transparent; }
-QLabel#DurationChip { background:#eeecff; border:1px solid #dcd7ff; color:#594cc4; border-radius:10px; padding:6px 12px; font-weight:800; font-size:8.5pt; }
-QFrame#SearchPanel { background:#ffffff; border:1px solid #e2e4ef; border-radius:20px; }
-QLabel#PanelEyebrow { color:#6657d9; font-size:8pt; font-weight:850; letter-spacing:1.2px; background:transparent; }
-QComboBox#ModeSelector, QComboBox#GenreSelector, QLineEdit#SearchInput { background:#f9f9fe; color:#25243d; border:1px solid #dfe1ed; border-radius:12px; padding:11px 14px; }
-QComboBox#ModeSelector:focus, QComboBox#GenreSelector:focus, QLineEdit#SearchInput:focus { border:1px solid #8175eb; background:#fff; }
-QLabel#ImageDropZone { background:#fafaff; color:#6d7088; border:1px dashed #c9c9df; border-radius:13px; padding:10px; }
-QPushButton#PrimarySearch { background:#6657e8; color:#fff; border:0; border-radius:12px; padding:12px 18px; font-weight:850; }
-QPushButton#PrimarySearch:hover { background:#796cf2; }
-QPushButton#ToolbarButton { background:#fff; color:#393653; border:1px solid #dedfed; border-radius:12px; padding:10px 14px; font-weight:750; }
-QPushButton#ToolbarButton:hover { background:#f0effa; border-color:#c9c4ed; }
-QPushButton#ThemeToggle { min-width:44px; max-width:44px; min-height:44px; max-height:44px; padding:0; border-radius:12px; background:#fff; color:#393653; border:1px solid #dedfed; font-size:17pt; }
-QLabel#SectionHeading { font-size:17pt; font-weight:850; color:#25243b; background:transparent; }
-QFrame#StatusPanel { background:#fff; border:1px solid #e2e4ef; border-radius:13px; }
-QWidget#GalleryCanvas { background:transparent; }
-QLabel#FooterLabel { color:#85869a; font-size:7.5pt; font-weight:800; letter-spacing:1px; background:transparent; }
-QLabel#FooterSignature { color:#73758b; font-size:8pt; font-weight:700; background:transparent; }
-"""
-
-def load_config():
-    try:
-        if not CONFIG_PATH.exists():
-            return {}
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        logging.exception("Could not read settings file; using safe defaults")
-        return {}
-
-def save_config(data):
-    """Atomically save local settings; return False instead of crashing a UI slot."""
-    temporary = CONFIG_PATH.with_suffix(".json.tmp")
-    try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(temporary, CONFIG_PATH)
-        return True
-    except Exception:
-        logging.exception("Could not save application settings")
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            logging.exception("Could not remove incomplete settings temp file")
-        return False
-
-
-class WorkerSignals(QObject):
-    finished = Signal(object, object)
-    progress = Signal(str)
-
-class SearchWorker(QRunnable):
-    """Fetch YouTube videos from the original search phrase; image mode compares thumbnails locally."""
-    def __init__(self, api_key, query, page_token="", batch_size=BATCH_SIZE,
-                 min_minutes=40, reference_image="", movie_genre="Any genre",
-                 ):
-        super().__init__()
-        self.signals = WorkerSignals()
-        self.api_key, self.query, self.page_token = api_key, query, page_token
-        self.batch_size = batch_size
-        self.min_seconds = int(min_minutes) * 60
-        self.reference_image = reference_image
-        self.image_mode = bool(reference_image)
-        self.movie_genre = movie_genre
-
-    @staticmethod
-    def duration_seconds(value):
-        return parse_youtube_duration(value)
-
-    @staticmethod
-    def _visual_signature(image_bytes):
-        if not image_bytes or not ensure_cv_available():
-            return None
-        data = np.frombuffer(image_bytes, dtype=np.uint8)
-        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if image is None:
-            return None
-        image = cv2.resize(image, (160, 90), interpolation=cv2.INTER_AREA)
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [24, 24], [0, 180, 0, 256])
-        cv2.normalize(hist, hist)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        tiny = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
-        dhash = (tiny[:, 1:] > tiny[:, :-1]).flatten()
-        orb = cv2.ORB_create(nfeatures=450, scaleFactor=1.2, nlevels=6)
-        _keypoints, descriptors = orb.detectAndCompute(gray, None)
-        return hist, dhash, descriptors
-
-    @staticmethod
-    def _similarity(a, b):
-        if a is None or b is None or not ensure_cv_available():
-            return 0.0
-        hist_score = max(0.0, float(cv2.compareHist(a[0], b[0], cv2.HISTCMP_CORREL)))
-        hash_score = 1.0 - float(np.count_nonzero(a[1] != b[1])) / 64.0
-        feature_score = 0.0
-        if a[2] is not None and b[2] is not None and len(a[2]) >= 4 and len(b[2]) >= 4:
-            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-            matches = matcher.match(a[2], b[2])
-            good = sum(1 for m in matches if m.distance < 58)
-            feature_score = min(1.0, good / max(12.0, min(len(a[2]), len(b[2])) * 0.18))
-        return max(0.0, min(1.0, 0.40 * hist_score + 0.25 * hash_score + 0.35 * feature_score))
-
-    def run(self):
-        try:
-            reference_signature = None
-            if self.image_mode:
-                if not ensure_cv_available():
-                    raise RuntimeError("Similar-image search needs OpenCV and NumPy. Install the project dependencies using the instructions in DEBUGGING.md.")
-                reference_bytes = Path(self.reference_image).read_bytes()
-                reference_signature = self._visual_signature(reference_bytes)
-                if reference_signature is None:
-                    raise RuntimeError("The selected reference image could not be read.")
-
-            search_query = self.query
-            token = self.page_token
-            results, visited = [], set()
-            next_token = token
-            pages_checked = 0
-            # Bound each fetch pass so the UI gets a batch quickly and API quota is controlled.
-            # Further pages are fetched only when the user scrolls for more.
-            max_pages = 5
-            while len(results) < self.batch_size and pages_checked < max_pages:
-                self.signals.progress.emit(
-                    f"Finding popular movies… {len(results)}/{self.batch_size}")
-                params = {"part": "snippet", "type": "video", "maxResults": 50,
-                          "order": "viewCount", "videoDuration": "long", "key": self.api_key,
+PATHS = {
+    "logo": '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3z"/>',
+    "search": '<circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/>',
+    "create": '<path d="M12 2l2.5 7.5L22 12l-7.5 2.5L12 22l-2.5-7.5L2 12l7.5-2.5z"/>',
+    "edit": '<path d="m4 16-1 5 5-1L20 8l-4-4zM13 7l4 4"/>',
+    "image": '<rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="9" r="1"/><path d="m4 17 5-4 4 3 4-5 4 4"/>',
+    "sun": '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
+    "moon": '<path d="M20.5 14.7A8.7 8.7 0 0 1 9.3 3.5 8.8 8.8 0 1 0 20.5 14.7Z"/>',
+    "settings": '<path d="M4 6h16M4 12h16M4 18h16"/><path stroke-width="4" d="M9 6h.1m6 6h.1M8 18h.1"/>',
+    "update": '<path d="M20 8A8.5 8.5 0 0 0 5 6L3 9m0-5v5h5m-4 7a8.5 8.5 0 0 0 15 2l2-3m0 5v-5h-5"/>',
+    "save": '<path d="M12 3v12m-4-4 4 4 4-4M4 16v4h16v-4"/>',
+    "watch": '<path d="m8 5 11 7-11 7z"/>',
 }
-                # YouTube exposes broad video categories, not reliable movie-genre metadata.
-                # Genre selection is therefore applied as search keywords, then duration-filtered.
-                query_parts = [search_query.strip()] if search_query.strip() else []
-                if self.movie_genre and self.movie_genre != "Any genre":
-                    query_parts.append(self.movie_genre.lower())
-                if self.image_mode and not query_parts:
-                    query_parts.append("full movie")
-                elif query_parts and not any("movie" in q.lower() or "film" in q.lower() for q in query_parts):
-                    query_parts.append("movie")
-                if query_parts:
-                    params["q"] = " ".join(query_parts)
-                if token:
-                    params["pageToken"] = token
-                r = requests.get("https://www.googleapis.com/youtube/v3/search",
-                                 params=params, timeout=(5, 20))
-                r.raise_for_status()
-                payload = r.json()
-                raw = payload.get("items", [])
-                ids = [x.get("id", {}).get("videoId") for x in raw]
-                ids = [x for x in ids if x and x not in visited]
-                visited.update(ids)
-                details = {}
-                if ids:
-                    self.signals.progress.emit("Checking movie duration and popularity…")
-                    vr = requests.get("https://www.googleapis.com/youtube/v3/videos",
-                        params={"part": "contentDetails,statistics", "id": ",".join(ids),
-                                "key": self.api_key}, timeout=(5, 20))
-                    vr.raise_for_status()
-                    details = {x["id"]: x for x in vr.json().get("items", [])}
-                for item in raw:
-                    vid = item.get("id", {}).get("videoId")
-                    if not vid or vid not in details:
-                        continue
-                    detail = details[vid]
-                    seconds = self.duration_seconds(
-                        detail.get("contentDetails", {}).get("duration", ""))
-                    if seconds < self.min_seconds:
-                        continue
-                    sn = item.get("snippet", {})
-                    thumbs = sn.get("thumbnails", {})
-                    quality_order = ("maxres", "standard", "high", "medium", "default")
-                    best_quality = next((k for k in quality_order
-                        if k in thumbs and thumbs[k].get("url")), "")
-                    best_thumb = thumbs.get(best_quality, {})
-                    best = best_thumb.get("url", "")
-                    similarity = None
-                    if self.image_mode:
-                        try:
-                            tr = requests.get(best, timeout=(5, 12))
-                            tr.raise_for_status()
-                            candidate_signature = self._visual_signature(tr.content)
-                            similarity = self._similarity(reference_signature, candidate_signature)
-                        except Exception:
-                            continue
-                        # Only keep visually related thumbnails; this is not face recognition.
-                        if similarity < 0.38:
-                            continue
-                    stats = detail.get("statistics", {})
-                    result = {
-                        "id": vid, "title": sn.get("title", "Untitled"),
-                        "channel": sn.get("channelTitle", ""),
-                        "published": sn.get("publishedAt", "")[:10],
-                        "views": int(stats.get("viewCount", 0)),
-                        "thumbnail": best, "thumbnail_quality": best_quality,
-                        "thumbnail_width": best_thumb.get("width", 0),
-                        "thumbnail_height": best_thumb.get("height", 0),
-                        "duration": seconds,
-                        "video_url": "https://www.youtube.com/watch?v=" + vid
-                    }
-                    if similarity is not None:
-                        result["similarity"] = similarity
-                    results.append(result)
-                next_token = payload.get("nextPageToken", "")
-                pages_checked += 1
-                if not next_token or not raw:
-                    break
-                if pages_checked >= max_pages:
-                    # Keep the token so another bounded page batch can load on scroll.
-                    break
-                token = next_token
-            # In every mode, popular videos are shown first.
-            if self.image_mode:
-                results.sort(key=lambda x: (x.get("similarity", 0), x["views"]), reverse=True)
-            else:
-                results.sort(key=lambda x: x["views"], reverse=True)
-            self.signals.finished.emit({"items": results, "next": next_token}, None)
-        except Exception as e:
-            logging.exception("Movie search worker failed")
-            message = str(e)
-            response = getattr(e, "response", None)
-            if response is not None:
-                try:
-                    payload = response.json()
-                    message = payload.get("error", {}).get("message") or message
-                except Exception:
-                    pass
-            self.signals.finished.emit(None, message)
 
-class ImageSignals(QObject):
-    done = Signal(bytes)
 
-class DownloadSignals(QObject):
-    done = Signal(str, str)
+def icon(name, color="#9ca3b6", size=24):
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+           f'stroke="{color}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
+           f'{PATHS[name]}</svg>')
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    QSvgRenderer(svg.encode()).render(painter)
+    painter.end()
+    return QIcon(pixmap)
 
-class DownloadWorker(QRunnable):
-    def __init__(self, items, folder):
+
+def label(text, style=""):
+    widget = QLabel(text)
+    widget.setTextFormat(Qt.TextFormat.PlainText)
+    widget.setObjectName(style)
+    return widget
+
+
+def button(text, callback, style="", glyph=None):
+    widget = QPushButton(text)
+    widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    widget.setObjectName(style)
+    widget.clicked.connect(callback)
+    if glyph:
+        widget.setProperty("glyph", glyph)
+    return widget
+
+
+def panel(style="surface"):
+    widget = QFrame()
+    widget.setObjectName(style)
+    return widget
+
+
+def row(*widgets):
+    layout = QHBoxLayout()
+    layout.setSpacing(8)
+    for widget in widgets:
+        layout.addWidget(widget)
+    return layout
+
+
+class TaskSignals(QObject):
+    done = Signal(object, object)
+
+
+class Task(QRunnable):
+    def __init__(self, action):
         super().__init__()
-        self.items = items
-        self.folder = folder
-        self.signals = DownloadSignals()
+        self.action = action
+        self.signals = TaskSignals()
 
     def run(self):
-        saved, failed = 0, 0
         try:
-            self.folder.mkdir(parents=True, exist_ok=True)
-            for item in self.items:
-                try:
-                    if not item.get("thumbnail"):
-                        failed += 1
-                        continue
-                    response = requests.get(item["thumbnail"], timeout=(5, 20))
-                    response.raise_for_status()
-                    safe_title = "".join(
-                        c for c in item.get("title", "thumbnail")
-                        if c.isalnum() or c in " -_").strip().replace(" ", "_")[:75]
-                    name = safe_title or item.get("id", "thumbnail")
-                    from PIL import Image
-                    from io import BytesIO
-                    target = self.folder / f"{name}_{item.get('id', saved)}.jpg"
-                    with Image.open(BytesIO(response.content)) as source:
-                        source.convert("RGB").save(target, format="JPEG", quality=95, optimize=True)
-                    saved += 1
-                except Exception:
-                    failed += 1
-                    logging.exception("Could not download thumbnail for video %s", item.get("id"))
-            summary = f"Downloaded {saved} thumbnail(s)."
-            if failed:
-                summary += f" {failed} failed. See the log for details."
-            self.signals.done.emit(summary, "" if saved else "No thumbnails could be downloaded.")
-        except Exception as exc:
-            logging.exception("Thumbnail download batch failed")
-            self.signals.done.emit("Download failed.", str(exc))
-
-
-class ImageWorker(QRunnable):
-    def __init__(self, url):
-        super().__init__(); self.url=url; self.signals=ImageSignals()
-    def run(self):
-        try:
-            r=requests.get(self.url,timeout=(5, 12)); r.raise_for_status(); self.signals.done.emit(r.content)
-        except Exception:
-            logging.exception("Thumbnail preview download failed: %s", self.url)
-            self.signals.done.emit(b"")
-
-class SettingsDialog(QDialog):
-    def __init__(self, parent, download_dir):
-        super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.setMinimumWidth(430)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 22)
-        layout.setSpacing(16)
-        form = QFormLayout()
-        form.setVerticalSpacing(12)
-        form.setHorizontalSpacing(14)
-        self.download_path = QLineEdit(str(download_dir))
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self.browse_folder)
-        path_row = QHBoxLayout()
-        path_row.addWidget(self.download_path, 1)
-        path_row.addWidget(browse)
-        form.addRow("Download location", path_row)
-        layout.addLayout(form)
-        note = QLabel("Your YouTube Data API key is stored locally in your user profile. Keep it private; it is not uploaded to Thumb Finder or GitHub.")
-        note.setWordWrap(True)
-        note.setObjectName("Muted")
-        layout.addWidget(note)
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def browse_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose download folder", self.download_path.text().strip() or str(DOWNLOAD_ROOT))
-        if folder:
-            self.download_path.setText(folder)
-
-
-class ThumbCard(QFrame):
-    def __init__(self, item, parent):
-        super().__init__()
-        self.setObjectName("Card")
-        self.item = item
-        self.parent_window = parent
-        self.setMinimumWidth(230)
-        self.setMaximumWidth(440)
-        fade = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(fade)
-        fade.setOpacity(0.0)
-        self._fade_animation = QPropertyAnimation(fade, b"opacity", self)
-        self._fade_animation.setDuration(220)
-        self._fade_animation.setStartValue(0.0)
-        self._fade_animation.setEndValue(1.0)
-        self._fade_animation.setEasingCurve(QEasingCurve.OutCubic)
-        self._fade_animation.start()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
-
-        self.image = QLabel("Loading preview…")
-        self.image.setAlignment(Qt.AlignCenter)
-        self.image.setMinimumHeight(165)
-        self.image.setMaximumHeight(230)
-        self.image.setStyleSheet("background:rgba(120,120,140,0.12); border-radius:11px;")
-        self.image.setMouseTracking(True)
-        self._image_hover_animation = None
-        layout.addWidget(self.image)
-
-        title = QLabel(item["title"])
-        title.setWordWrap(True)
-        title.setMinimumHeight(40)
-        title.setMaximumHeight(48)
-        title.setStyleSheet("font-size:10pt;font-weight:700;background:transparent;border:0;")
-        title.setToolTip(item["title"])
-        layout.addWidget(title)
-
-        views = QLabel(f"◉  {item['views']:,} views")
-        views.setStyleSheet("font-weight:700;background:transparent;border:0;")
-        layout.addWidget(views)
-        if item.get("similarity") is not None:
-            match = QLabel(f"▧  Visual match · {item['similarity'] * 100:.0f}%")
-            match.setStyleSheet("font-weight:700;background:transparent;border:0;")
-            layout.addWidget(match)
-        meta = QLabel(f"{item.get('published','')}   ·   {item.get('duration',0)//60} min+\n{item.get('channel','')}")
-        meta.setObjectName("Muted")
-        meta.setWordWrap(True)
-        meta.setStyleSheet("font-size:8.5pt;background:transparent;border:0;")
-        layout.addWidget(meta)
-
-        row = QHBoxLayout()
-        row.setSpacing(7)
-        dl = QPushButton("↓  Save")
-        dl.setObjectName("SmallAction")
-        dl.clicked.connect(lambda: parent.download_item(item))
-        openb = QPushButton("▶  Watch")
-        openb.setObjectName("Secondary")
-        openb.setProperty("class", "secondary")
-        openb.setStyleSheet("padding:8px 10px;font-size:9pt;")
-        openb.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(item["video_url"])))
-        editb = QPushButton("✎  Edit")
-        editb.setObjectName("Secondary")
-        editb.setProperty("class", "secondary")
-        editb.setStyleSheet("padding:8px 10px;font-size:9pt;")
-        editb.clicked.connect(lambda: parent.open_thumbnail_editor(item))
-        row.addWidget(dl, 1); row.addWidget(openb, 1); row.addWidget(editb, 1)
-        layout.addLayout(row)
-
-        if item.get("thumbnail"):
-            worker = ImageWorker(item["thumbnail"])
-            worker.signals.done.connect(self.set_image)
-            parent.image_workers.append(worker)
-            worker.signals.done.connect(lambda _data, w=worker: parent.image_workers.remove(w) if w in parent.image_workers else None)
-            parent.pool.start(worker)
-
-    def _animate_thumbnail(self, hovered):
-        target = 190 if hovered else 165
-        if self._image_hover_animation is not None:
-            self._image_hover_animation.stop()
-        animation = QPropertyAnimation(self.image, b"minimumHeight", self)
-        animation.setDuration(190)
-        animation.setStartValue(self.image.minimumHeight())
-        animation.setEndValue(target)
-        animation.setEasingCurve(QEasingCurve.OutCubic)
-        self._image_hover_animation = animation
-        animation.start()
-
-    def enterEvent(self, event):
-        self._animate_thumbnail(True)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._animate_thumbnail(False)
-        super().leaveEvent(event)
-
-    def set_image(self, data):
-        if not data:
-            self.image.setText("Preview unavailable")
-            return
-        pix = QPixmap()
-        pix.loadFromData(data)
-        if not pix.isNull():
-            self.image.setPixmap(pix.scaled(420, 190, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            result = self.action()
+        except Exception as error:
+            self.signals.done.emit(None, str(error) or type(error).__name__)
         else:
-            self.image.setText("Preview unavailable")
+            self.signals.done.emit(result, None)
 
-class MainWindow(QMainWindow):
+
+class Picture(QWidget):
+    selected = Signal(object)
+
+    def __init__(self, height=130):
+        super().__init__()
+        self.setMinimumHeight(height)
+        self.pixmap = QPixmap()
+        self.mask_preview = QImage()
+        self.placeholder = "No image"
+        self.selectable = False
+        self.selection_mode = "box"
+        self.brush = 0.035
+        self.stroke = []
+        self.canvas_color = QColor("#ebe8f3")
+        self.text_color = QColor("#625d78")
+        self.start = self.end = None
+
+    def set_data(self, data, placeholder=None):
+        self.pixmap = QPixmap.fromImage(data) if isinstance(data, QImage) else QPixmap()
+        if placeholder is not None:
+            self.placeholder = placeholder
+        self.update()
+
+    def image_rect(self):
+        if self.pixmap.isNull():
+            return QRect()
+        size = self.pixmap.size().scaled(self.size() - QSize(8, 8), Qt.AspectRatioMode.KeepAspectRatio)
+        return QRect(QPoint((self.width() - size.width()) // 2, (self.height() - size.height()) // 2), size)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.canvas_color)
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 9, 9)
+        if self.pixmap.isNull():
+            painter.setPen(self.text_color)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.placeholder)
+        else:
+            bounds = self.image_rect()
+            painter.drawPixmap(bounds, self.pixmap)
+            painter.setClipRect(bounds)
+            if not self.mask_preview.isNull():
+                painter.drawImage(bounds, self.mask_preview)
+        if self.selection_mode == "brush" and self.stroke:
+            pen = QPen(QColor(175, 145, 255, 165), max(2, round(self.image_rect().width() * self.brush)))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            if len(self.stroke) == 1:
+                painter.drawPoint(self.stroke[0])
+            else:
+                painter.drawPolyline(QPolygon(self.stroke))
+        elif self.start is not None and self.end is not None:
+            painter.setPen(QPen(QColor("#a89cff"), 2, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(145, 122, 255, 48))
+            painter.drawRect(QRect(self.start, self.end).normalized())
+
+    def mousePressEvent(self, event):
+        point = event.position().toPoint()
+        if self.selectable and event.button() == Qt.MouseButton.LeftButton and self.image_rect().contains(point):
+            self.start = self.end = point
+            self.stroke = [point] if self.selection_mode == "brush" else []
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.start is not None:
+            bounds = self.image_rect()
+            point = event.position().toPoint()
+            self.end = QPoint(max(bounds.left(), min(bounds.right(), point.x())),
+                              max(bounds.top(), min(bounds.bottom(), point.y())))
+            if self.stroke and self.end != self.stroke[-1]:
+                self.stroke.append(self.end)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self.start is None:
+            return
+        self.mouseMoveEvent(event)
+        selection = QRect(self.start, self.end).normalized()
+        bounds = self.image_rect()
+        points = self.stroke or [selection.topLeft(), selection.bottomRight()]
+        self.start = self.end = None
+        self.stroke = []
+        self.update()
+        if self.selection_mode == "brush" or (selection.width() > 5 and selection.height() > 5):
+            self.selected.emit((self.selection_mode,
+                                [(float(point.x() - bounds.left()) / bounds.width(),
+                                  float(point.y() - bounds.top()) / bounds.height()) for point in points],
+                                self.brush))
+
+
+class ThemeSwitch(QPushButton):
+    def __init__(self, dark, callback):
+        super().__init__()
+        self.setFixedSize(64, 34)
+        self.setAccessibleName("Toggle light and dark theme")
+        self.setToolTip("Toggle light and dark theme")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.position = float(dark)
+        self.animation = QVariantAnimation(self, duration=180)
+        self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.animation.valueChanged.connect(self.move_thumb)
+        self.clicked.connect(callback)
+
+    def move_thumb(self, value):
+        self.position = value
+        self.update()
+
+    def animate(self, dark):
+        self.animation.stop()
+        self.animation.setStartValue(self.position)
+        self.animation.setEndValue(float(dark))
+        self.animation.start()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        dark = self.position >= 0.5
+        painter.setPen(QPen(QColor("#41415a" if dark else "#ccc7e2")))
+        painter.setBrush(QColor("#252537" if dark else "#e8e4f6"))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 16, 16)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#6753cf" if dark else "#ffffff"))
+        painter.drawEllipse(5 + round(29 * self.position), 5, 24, 24)
+        icon("sun", "#b4adcf" if dark else "#5645ad").paint(painter, 10, 10, 14, 14)
+        icon("moon", "#ffffff" if dark else "#665d82").paint(painter, 39, 10, 14, 14)
+
+
+class Window(QMainWindow):
+    offline_progress = Signal(str)
+    draft_ready = Signal(object, int)
+
     def __init__(self):
         super().__init__()
-        self.config = load_config()
-        self.api_key = load_youtube_api_key() or str(self.config.get("youtube_api_key", "")).strip()
-        try:
-            configured_download_dir = self.config.get("download_dir", str(DOWNLOAD_ROOT))
-            self.download_dir = Path(configured_download_dir).expanduser()
-        except (TypeError, ValueError, OSError):
-            logging.exception("Invalid saved download directory; using default")
-            self.download_dir = DOWNLOAD_ROOT
-        self.config.pop("search_language", None)
-        self.theme_preference = self.config.get("theme", "system")
-        if self.theme_preference not in ("system", "dark", "light"):
-            # Migrate older builds that stored a boolean dark setting.
-            self.theme_preference = "dark" if self.config.get("dark", False) else "system"
-        self.dark = self.resolve_system_dark() if self.theme_preference == "system" else self.theme_preference == "dark"
-        self.next_token = ""
-        self.last_query = ""
-        self.loading_more = False
-        self.auto_load_enabled = True
-        self.has_more_pages = False
-        try:
-            self.min_duration_minutes = int(self.config.get("min_duration_minutes", 40))
-        except (TypeError, ValueError):
-            logging.exception("Invalid saved minimum duration; using 40 minutes")
-            self.min_duration_minutes = 40
-        self.min_duration_minutes = max(40, min(360, self.min_duration_minutes))
-        self.movie_genre = self.config.get("movie_genre", "Any genre")
-        if not isinstance(self.movie_genre, str):
-            self.movie_genre = "Any genre"
-        self.search_folder_name = ""
-        self.search_image_path = ""
-        self.seen_ids = set()
-        self.pool = QThreadPool.globalInstance()
-        self.search_workers = []
-        self.image_workers = []
-        self.download_workers = []
-        self._visible_cards = []
-        self.setWindowTitle("Thumb Finder")
-        resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-        icon_path = resource_root / ("app_icon.ico" if sys.platform == "win32" else "app_icon.icns")
-        if not icon_path.exists():
-            icon_path = resource_root / "app_icon.svg"
-        self.app_icon_path = icon_path if icon_path.exists() else None
-        if self.app_icon_path:
-            self.setWindowIcon(QIcon(str(self.app_icon_path)))
-        self.setMinimumSize(480,520)
-        self.resize(1240,860)
-        self.build_ui()
+        self.settings = QSettings()
+        self.dark = self.settings.value("dark", QApplication.styleHints().colorScheme() ==
+                                        Qt.ColorScheme.Dark, type=bool)
+        self.create_stop = Event()
+        self.stop_batch = Event()
+        self.create_paths = ["", ""]
+        self.create_outputs = []
+        self.offline_busy = False
+        self.downloading = False
+        self.remove_selections = []
+        self.offline_stop = Event()
+        data_root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation))
+        self.history_root = data_root / "Drafts"
+        self.model_root = data_root / "Models"
+        self.youtube = self.make_youtube()
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(4)
+        self.search_pool = QThreadPool(self)
+        self.search_pool.setMaxThreadCount(1)
+        self.image_pool = QThreadPool(self)
+        self.image_pool.setMaxThreadCount(5)
+        self.tasks = set()
+        self.results = {}
+        self.cards = {}
+        self.cache = OrderedDict()
+        self.cache_bytes = 0
+        self.search_generation = 0
+        self.searching = False
+        self.next_token = None
+        self.empty_pages = 0
+        self.reference = None
+        self.rank = {}
+        self.rank_timer = QTimer(self, interval=90, singleShot=True)
+        self.rank_timer.timeout.connect(self.arrange_cards)
+        self.columns = None
+        self.candidates = [studio.Candidate() for _ in "ABC"]
+        self.active = 0
+        self.preview_revision = [0, 0, 0]
+        self.preview_busy = False
+        self.preview_dirty = set()
+        self.preview_timer = QTimer(self, interval=55, singleShot=True)
+        self.preview_timer.timeout.connect(self.update_previews)
+        self.setWindowTitle(f"Thumb Finder v{VERSION}")
+        app_icon = QIcon(str(Path(__file__).with_name("app_icon.svg")))
+        QApplication.instance().setWindowIcon(app_icon)
+        self.setWindowIcon(app_icon)
+        self.resize(1240, 865)
+        self.setMinimumSize(875, 680)
+
+        body = QWidget()
+        body.setObjectName("body")
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(26, 16, 26, 14)
+        layout.setSpacing(15)
+        logo = label("")
+        logo.setPixmap(app_icon.pixmap(42, 42))
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setFixedSize(42, 42)
+        name = label("Thumb Finder", "brand")
+        version = label(f"v{VERSION}", "muted")
+        header = row(logo, name, version)
+        header.setSpacing(10)
+        header.addStretch()
+        nav = panel("nav")
+        nav_layout = QHBoxLayout(nav)
+        nav_layout.setContentsMargins(4, 4, 4, 4)
+        nav_layout.setSpacing(3)
+        self.nav = []
+        for index, (title, glyph) in enumerate(zip(("Search", "Create", "Edit"), ("search", "create", "edit"))):
+            item = button(title, partial(self.show_page, index), "tab", glyph)
+            item.setCheckable(True)
+            nav_layout.addWidget(item)
+            self.nav.append(item)
+        header.addWidget(nav)
+        header.addStretch()
+        self.theme = ThemeSwitch(self.dark, self.toggle_theme)
+        header.addWidget(self.theme)
+        update = button("Updates", self.check_updates, "", "update")
+        update.setToolTip("Check for updates")
+        header.addWidget(update)
+        header.addWidget(button("Settings", self.open_settings, "", "settings"))
+        layout.addLayout(header)
+
+        self.pages = QStackedWidget()
+        layout.addWidget(self.pages, 1)
+        self.pages.addWidget(self.build_search())
+        self.pages.addWidget(self.build_create())
+        self.pages.addWidget(self.build_editor())
+        self.footer = label("Ready", "muted")
+        footer = row(self.footer)
+        self.footer.setMinimumWidth(0)
+        self.footer.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        footer.setStretch(0, 1)
+        footer.addWidget(label("Thumb Finder by Hemant", "credit"))
+        layout.addLayout(footer)
+        self.setCentralWidget(body)
+        self.offline_progress.connect(self.notice, Qt.ConnectionType.QueuedConnection)
+        self.draft_ready.connect(self.show_generation_progress, Qt.ConnectionType.QueuedConnection)
         self.apply_theme()
+        self.show_page(0)
+        self.sync_editor()
 
-    def run_first_launch_setup(self):
-        """Prepare writable user folders; never contact GitHub in local debug mode."""
+    def make_youtube(self):
         try:
-            self.download_dir.mkdir(parents=True, exist_ok=True)
-            self.config.setdefault("setup_complete", True)
-            self.config.setdefault("download_dir", str(self.download_dir))
-            if not save_config(self.config):
-                self.status.setText("Settings could not be saved; check user-folder permissions.")
-            return True
-        except Exception as exc:
-            logging.exception("First-launch setup failed")
-            QMessageBox.critical(
-                self, "Setup error",
-                f"Thumb Finder could not prepare its user folders.\n\n{exc}"
-            )
-            return False
+            from ._build_keys import KEYS
+        except ImportError:
+            KEYS = ("", "")
+        return YouTube(self.settings.value(f"youtube/key{index}", "", type=str).strip()
+                       or os.environ.get(f"YOUTUBE_API_KEY_{index}", "").strip() or KEYS[index - 1]
+                       for index in (1, 2))
 
-    def prompt_for_api_key(self):
-        """Ask for a key only after the main window is visible, keeping launch responsive."""
-        if self.api_key:
-            self.search_btn.setEnabled(True)
-            return True
-        self.search_btn.setEnabled(False)
-        self.status.setText("YouTube API key required before searching.")
-        key, accepted = QInputDialog.getText(
-            self, "YouTube Data API key",
-            "Enter your YouTube Data API key to use movie search:",
-            QLineEdit.Password,
-        )
-        key = key.strip()
-        if not accepted or not key:
-            self.status.setText("Add your YouTube API key to start searching.")
-            return False
-        if not key:
-            self.status.setText("No API key entered. Search remains disabled until a key is provided.")
-            return False
-        self.api_key = key
-        self.config["youtube_api_key"] = key
-        if not save_config(self.config):
-            self.api_key = ""
-            self.config.pop("youtube_api_key", None)
-            QMessageBox.warning(
-                self, "Could not save API key",
-                "The key was entered but could not be saved. Check folder permissions and try again."
-            )
-            return False
-        self.search_btn.setEnabled(True)
-        self.status.setText("API key saved locally. Ready to search.")
-        logging.info("YouTube API key saved to local user settings")
-        return True
+    def task(self, action, callback, pool=None):
+        task = Task(action)
+        task.is_search = pool in (self.image_pool, self.search_pool)
+        self.tasks.add(task)
 
-    def build_ui(self):
-        """Build the redesigned local-first discovery workspace."""
-        central = QWidget()
-        central.setObjectName("AppCanvas")
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(24, 20, 24, 18)
-        root.setSpacing(18)
+        def finished(result, error):
+            self.tasks.discard(task)
+            callback(result, error)
 
-        # Top navigation / brand bar (can collapse while browsing results)
-        self.top_widget = QWidget()
-        top = QHBoxLayout(self.top_widget)
-        top.setContentsMargins(0, 0, 0, 0)
-        top.setSpacing(12)
-        logo = QLabel()
-        logo.setFixedSize(46, 46)
-        logo.setAlignment(Qt.AlignCenter)
-        if self.app_icon_path:
-            logo.setPixmap(QIcon(str(self.app_icon_path)).pixmap(QSize(46, 46)))
-        else:
-            logo.setText("✦")
-            logo.setStyleSheet(
-                "background:#6657e8;color:white;border-radius:14px;"
-                "font-size:23pt;font-weight:800;"
-            )
-        top.addWidget(logo)
+        task.signals.done.connect(finished, Qt.ConnectionType.QueuedConnection)
+        (pool or self.pool).start(task)
 
-        brand_col = QVBoxLayout()
-        brand_col.setSpacing(0)
-        brand = QLabel("Thumb Finder")
-        brand.setObjectName("BrandTitle")
-        strap = QLabel("YOUTUBE THUMBNAIL TOOLS")
-        strap.setObjectName("BrandSubtitle")
-        brand_col.addWidget(brand)
-        brand_col.addWidget(strap)
-        top.addLayout(brand_col)
-        top.addStretch(1)
+    def notice(self, text):
+        self.footer.setText(text)
 
-        self.theme_btn = QPushButton()
-        self.theme_btn.setObjectName("ThemeToggle")
-        self.theme_btn.setFixedSize(44, 44)
-        self.theme_btn.setCursor(Qt.PointingHandCursor)
-        self.theme_btn.setToolTip("Switch light or dark appearance")
-        self.theme_btn.clicked.connect(self.toggle_theme)
-        self.update_theme_button()
-        settings = QPushButton("⚙  Settings")
-        settings.setObjectName("ToolbarButton")
-        settings.setCursor(Qt.PointingHandCursor)
-        settings.clicked.connect(self.open_settings)
-        top.addWidget(self.theme_btn)
-        top.addWidget(settings)
-        root.addWidget(self.top_widget)
-
-        # Hero heading
-        self.hero_widget = QWidget()
-        hero = QHBoxLayout(self.hero_widget)
-        hero.setContentsMargins(0, 0, 0, 0)
-        hero_col = QVBoxLayout()
-        hero_col.setSpacing(3)
-        # Keep the hero container out of the way; the search and gallery are the focus.
-        self.hero_widget.setVisible(False)
-
-        # Search console: compact, full-width card with all modes.
-        search_panel = QFrame()
-        self.search_panel = search_panel
-        search_panel.setObjectName("SearchPanel")
-        search_outer = QVBoxLayout(search_panel)
-        search_outer.setContentsMargins(20, 18, 20, 18)
-        self.search_panel_layout = search_outer
-        search_outer.setSpacing(13)
-
-        search_top = QHBoxLayout()
-        search_label = QLabel("SEARCH MODE")
-        search_label.setObjectName("PanelEyebrow")
-        search_top.addWidget(search_label)
-        search_top.addStretch()
-        self.mode_hint = QLabel("Search by actor, topic or reference thumbnail")
-        self.mode_hint.setObjectName("Muted")
-        search_top.addWidget(self.mode_hint)
-        self.search_top_widget = QWidget()
-        self.search_top_widget.setLayout(search_top)
-        search_outer.addWidget(self.search_top_widget)
-
-        self.compact_search_btn = QPushButton("⌕   Search thumbnails   ·   Tap to expand")
-        self.compact_search_btn.setObjectName("CompactSearch")
-        self.compact_search_btn.setMinimumHeight(42)
-        self.compact_search_btn.clicked.connect(lambda: self.set_browse_compact(False))
-        self.compact_search_btn.hide()
-        search_outer.addWidget(self.compact_search_btn)
-
-        self.mode = QComboBox()
-        self.mode.setObjectName("ModeSelector")
-        self.mode.addItems([
-            "⌕   Search",
-            "▧   Via photo",
-        ])
-        self.mode.setMinimumHeight(44)
-        self.mode.setToolTip("Search by actor, movie title, topic or keyword, or find visually similar thumbnails from a photo.")
-        self.mode.currentIndexChanged.connect(self.update_placeholders)
-        search_outer.addWidget(self.mode)
-
-        self.search_input = QLineEdit()
-        self.search_input.setObjectName("SearchInput")
-        self.search_input.setPlaceholderText("Enter an actor, movie title or topic…")
-        self.search_input.setMinimumHeight(48)
-        self.search_input.returnPressed.connect(self.start_search)
-        search_outer.addWidget(self.search_input)
-        self.actor = self.search_input
-        self.topic = self.search_input
-
-        self.image_row_widget = QWidget()
-        self.image_row = QHBoxLayout(self.image_row_widget)
-        self.image_row.setContentsMargins(0, 0, 0, 0)
-        self.image_row.setSpacing(12)
-        self.image_preview = QLabel(
-            "Choose a reference thumbnail to find visually similar movie artwork."
-        )
-        self.image_preview.setObjectName("ImageDropZone")
-        self.image_preview.setMinimumHeight(64)
-        self.image_preview.setWordWrap(True)
-        self.image_preview.setAlignment(Qt.AlignCenter)
-        self.image_btn = QPushButton("▧   Choose image")
-        self.image_btn.setObjectName("ToolbarButton")
-        self.image_btn.setMinimumHeight(44)
-        self.image_btn.setCursor(Qt.PointingHandCursor)
-        self.image_btn.clicked.connect(self.choose_reference_image)
-        self.image_row.addWidget(self.image_preview, 1)
-        self.image_row.addWidget(self.image_btn)
-        search_outer.addWidget(self.image_row_widget)
-
-        filter_row = QHBoxLayout()
-        self.genre_filter_widget = QWidget()
-        genre_filter_layout = QHBoxLayout(self.genre_filter_widget)
-        genre_filter_layout.setContentsMargins(0, 0, 0, 0)
-        genre_filter_layout.setSpacing(8)
-        self.genre_toggle = QPushButton("＋  Add genre filter")
-        self.genre_toggle.setObjectName("Ghost")
-        self.genre_toggle.setMinimumHeight(40)
-        self.genre_toggle.setCheckable(True)
-        self.genre_toggle.toggled.connect(self.toggle_genre_filter)
-        genre_filter_layout.addWidget(self.genre_toggle)
-        self.genre_choice = QComboBox()
-        self.genre_choice.setObjectName("GenreSelector")
-        self.genre_choice.setMinimumHeight(42)
-        genre_items = [
-            ("🎬  Any genre", "Any genre"),
-            ("💥  Action", "Action"), ("🧭  Adventure", "Adventure"),
-            ("✨  Animation", "Animation"), ("😂  Comedy", "Comedy"),
-            ("🕵  Crime", "Crime"), ("🎥  Documentary", "Documentary"),
-            ("🎭  Drama", "Drama"), ("👨‍👩‍👧  Family", "Family"),
-            ("🐉  Fantasy", "Fantasy"), ("👻  Horror", "Horror"),
-            ("🔎  Mystery", "Mystery"), ("❤️  Romance", "Romance"),
-            ("🚀  Science Fiction", "Science Fiction"),
-            ("😱  Thriller", "Thriller"), ("⚔  War", "War"),
-            ("🤠  Western", "Western"),
-        ]
-        for visible, value in genre_items:
-            self.genre_choice.addItem(visible, value)
-        genre_index = self.genre_choice.findData(self.movie_genre)
-        self.genre_choice.setCurrentIndex(genre_index if genre_index >= 0 else 0)
-        self.genre_choice.setToolTip(
-            "Genre keywords are applied to actor and normal text searches."
-        )
-        genre_filter_layout.addWidget(self.genre_choice, 0)
-        self.genre_choice.setVisible(False)
-        filter_row.addWidget(self.genre_filter_widget, 0)
-        filter_row.addStretch(1)
-        self.search_btn = QPushButton("⌕   Find thumbnails")
-        self.search_btn.setObjectName("PrimarySearch")
-        self.search_btn.setMinimumHeight(46)
-        self.search_btn.setMinimumWidth(190)
-        self.search_btn.setCursor(Qt.PointingHandCursor)
-        self.search_btn.clicked.connect(self.start_search)
-        filter_row.addWidget(self.search_btn)
-        self.filter_row_widget = QWidget()
-        self.filter_row_widget.setLayout(filter_row)
-        search_outer.addWidget(self.filter_row_widget)
-        root.addWidget(search_panel)
-
-        # Results header
-        self.results_header_widget = QWidget()
-        results_bar = QHBoxLayout(self.results_header_widget)
-        results_bar.setContentsMargins(0, 0, 0, 0)
-        results_col = QVBoxLayout()
-        results_col.setSpacing(2)
-        results_title = QLabel("Explore thumbnails")
-        results_title.setObjectName("SectionHeading")
-        self.result_label = QLabel("")
-        self.result_label.setObjectName("Muted")
-        self.result_label.setWordWrap(True)
-        results_col.addWidget(results_title)
-        results_col.addWidget(self.result_label)
-        results_bar.addLayout(results_col, 1)
-        self.download_all_btn = QPushButton("↓  Download all shown")
-        self.download_all_btn.setObjectName("ToolbarButton")
-        self.download_all_btn.setEnabled(False)
-        self.download_all_btn.clicked.connect(self.download_all)
-        results_bar.addWidget(self.download_all_btn, 0, Qt.AlignVCenter)
-        root.addWidget(self.results_header_widget)
-
-        # Search status
-        status_panel = QFrame()
-        status_panel.setObjectName("StatusPanel")
-        status_l = QHBoxLayout(status_panel)
-        status_l.setContentsMargins(14, 9, 14, 9)
-        self.status = QLabel("Ready")
-        self.status.setObjectName("Muted")
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
-        self.progress.setTextVisible(False)
-        self.progress.setFixedWidth(145)
-        self.progress.hide()
-        self._loading_dots = 0
-        self.loading_timer = QTimer(self)
-        self.loading_timer.setInterval(360)
-        self.loading_timer.timeout.connect(self._animate_loading_status)
-        status_l.addWidget(self.status, 1)
-        status_l.addWidget(self.progress)
-        self.status_panel = status_panel
-        root.addWidget(status_panel)
-
-        # Gallery fills remaining space and adapts columns to window width.
-        self.scroll = QScrollArea()
-        self.scroll.setObjectName("ResultsScroll")
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-        self.gallery = QWidget()
-        self.gallery.setObjectName("GalleryCanvas")
-        self.grid = QGridLayout(self.gallery)
-        self.grid.setContentsMargins(2, 2, 8, 8)
-        self.grid.setHorizontalSpacing(16)
-        self.grid.setVerticalSpacing(16)
-        self.scroll.setWidget(self.gallery)
-        self.scroll.verticalScrollBar().valueChanged.connect(self.on_gallery_scroll)
-        root.addWidget(self.scroll, 1)
-
-        # Footer
-        self.footer_widget = QWidget()
-        footer = QHBoxLayout(self.footer_widget)
-        footer.setContentsMargins(0, 0, 0, 0)
-        footer_text = QLabel("YOUTUBE THUMBNAILS")
-        footer_text.setObjectName("FooterLabel")
-        footer.addWidget(footer_text)
-        footer.addStretch()
-        signature = QLabel("Thumb Finder v1.0")
-        signature.setObjectName("FooterSignature")
-        footer.addWidget(signature)
-        root.addWidget(self.footer_widget)
-
-        self._browse_compact = False
-        self.mode.setCurrentIndex(1)
-        self.update_placeholders()
-        self.show_empty_state()
-
-    def _animate_loading_status(self):
-        if not self.loading_more:
-            self.loading_timer.stop()
-            return
-        self._loading_dots = (self._loading_dots + 1) % 4
-        base = getattr(self, "_loading_base_text", "Searching movies")
-        self.status.setText(base + "." * self._loading_dots)
-
-    def set_loading_state(self, active, message="Searching movies"):
-        self.loading_more = bool(active)
-        if active:
-            self._loading_base_text = message.rstrip(".")
-            self.progress.show()
-            if not self.loading_timer.isActive():
-                self.loading_timer.start()
-        else:
-            self.loading_timer.stop()
-            self.progress.hide()
-
-    def show_empty_state(self):
-        self.empty_state = QFrame()
-        self.empty_state.setObjectName("Panel")
-        self.empty_state.setMinimumHeight(250)
-        box = QVBoxLayout(self.empty_state)
-        box.setAlignment(Qt.AlignCenter)
-        icon = QLabel("▧")
-        icon.setAlignment(Qt.AlignCenter)
-        icon.setStyleSheet("font-size:34pt;color:#8175eb;background:transparent;")
-        title = QLabel("Find movie thumbnails")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size:15pt;font-weight:800;background:transparent;")
-        box.addWidget(icon)
-        box.addWidget(title)
-        self.grid.addWidget(self.empty_state, 0, 0, 1, 4)
-
-    def toggle_genre_filter(self, checked):
-        self.genre_choice.setVisible(bool(checked))
-        self.genre_toggle.setText("−  Hide genre filter" if checked else "＋  Add genre filter")
-
-    def update_placeholders(self):
-        idx = self.mode.currentIndex()
-        self.search_input.setVisible(idx == 0)
-        self.image_row_widget.setVisible(idx == 1)
-        self.genre_filter_widget.setVisible(idx == 0 and not getattr(self, "_browse_compact", False))
-        self.mode_hint.setText(
-            "Enter an actor, movie or topic — search intent is detected automatically."
-            if idx == 0 else
-            "Choose a thumbnail photo to find visually similar results and infer its broad visual category."
-        )
-        if hasattr(self, "search_btn"):
-            self.search_btn.setText("⌕   Search thumbnails" if idx == 0 else "▧   Find similar thumbnails")
-
-    def choose_reference_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Choose reference thumbnail", "",
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
-        if not path:
-            return
-        self.actor_image_path = path
-        pix = QPixmap(path)
-        if not pix.isNull():
-            self.image_preview.setPixmap(pix.scaled(
-                58, 42, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            self.image_preview.setToolTip(path)
-        else:
-            self.image_preview.setText(Path(path).name)
-
-    @staticmethod
-    def resolve_system_dark():
-        try:
-            scheme = QApplication.instance().styleHints().colorScheme()
-            return scheme == Qt.ColorScheme.Dark
-        except Exception:
-            # Safe fallback when the platform does not expose a color scheme.
-            return False
-
-    def apply_theme(self, animate=False):
-        app = QApplication.instance()
-        app.setStyleSheet(DARK if self.dark else LIGHT)
-        if hasattr(self, "theme_btn"):
-            self.update_theme_button()
-        if animate and hasattr(self, "centralWidget") and self.centralWidget():
-            effect = QGraphicsOpacityEffect(self.centralWidget())
-            self.centralWidget().setGraphicsEffect(effect)
-            effect.setOpacity(0.72)
-            animation = QPropertyAnimation(effect, b"opacity", self)
-            animation.setDuration(180)
-            animation.setStartValue(0.72)
-            animation.setEndValue(1.0)
-            animation.setEasingCurve(QEasingCurve.OutCubic)
-            animation.finished.connect(lambda: self.centralWidget().setGraphicsEffect(None))
-            self._theme_animation = animation
-            animation.start()
-
-    def update_theme_button(self):
-        if hasattr(self, "theme_btn"):
-            self.theme_btn.setText("☀" if self.dark else "☾")
-            self.theme_btn.setToolTip("Switch to light mode" if self.dark else "Switch to dark mode")
-            self.theme_btn.setFixedSize(44, 44)
+    def show_page(self, index):
+        old = self.pages.currentWidget()
+        if old and old.graphicsEffect():
+            old.setGraphicsEffect(None)
+        self.pages.setCurrentIndex(index)
+        for position, item in enumerate(self.nav):
+            item.setChecked(position == index)
+        widget = self.pages.currentWidget()
+        effect = QGraphicsOpacityEffect(widget, opacity=0.82)
+        widget.setGraphicsEffect(effect)
+        self.fade = QVariantAnimation(effect, duration=145)
+        self.fade.setStartValue(0.82)
+        self.fade.setEndValue(1.0)
+        self.fade.valueChanged.connect(effect.setOpacity)
+        self.fade.finished.connect(lambda: widget.setGraphicsEffect(None))
+        self.fade.start()
 
     def toggle_theme(self):
         self.dark = not self.dark
-        if hasattr(self, "theme_btn"):
-            effect = self.theme_btn.graphicsEffect()
-            if not isinstance(effect, QGraphicsOpacityEffect):
-                effect = QGraphicsOpacityEffect(self.theme_btn)
-                self.theme_btn.setGraphicsEffect(effect)
-            fade_out = QPropertyAnimation(effect, b"opacity", self)
-            fade_out.setDuration(120)
-            fade_out.setStartValue(1.0)
-            fade_out.setEndValue(0.15)
-            fade_out.setEasingCurve(QEasingCurve.OutCubic)
-            def swap_theme_icon():
-                self.apply_theme(animate=False)
-                fade_in = QPropertyAnimation(effect, b"opacity", self)
-                fade_in.setDuration(220)
-                fade_in.setStartValue(0.15)
-                fade_in.setEndValue(1.0)
-                fade_in.setEasingCurve(QEasingCurve.OutBack)
-                fade_in.finished.connect(lambda: self.theme_btn.setGraphicsEffect(None))
-                self._theme_icon_animation = fade_in
-                fade_in.start()
-            fade_out.finished.connect(swap_theme_icon)
-            self._theme_icon_animation = fade_out
-            fade_out.start()
+        self.settings.setValue("dark", self.dark)
+        self.theme.animate(self.dark)
+        self.apply_theme()
+
+    def apply_theme(self):
+        bg, surface, sub, border, ink, muted, accent, hover = (
+            ("#12131b", "#1c1e2a", "#151722", "#303344", "#f3f3fc", "#afb3cc", "#a99bff", "#2c2d44")
+            if self.dark else
+            ("#f2f1f8", "#ffffff", "#f5f3fb", "#dedbeb", "#242238", "#625d78", "#5741c5", "#ece7fa")
+        )
+        self.ink = ink
+        self.canvas_color, self.muted = sub, muted
+        chevron = Path(__file__).with_name("chevron.svg").as_posix()
+        self.setStyleSheet(f"""
+            QWidget {{font-size: 13px; color: {ink};}}
+            QMainWindow, QWidget#body, QScrollArea, QWidget#scrollBody, QStackedWidget {{ background: {bg}; }}
+            QFrame#surface, QFrame#nav {{background: {surface}; border: 1px solid {border}; border-radius: 14px;}}
+            QFrame#picked {{background: {surface}; border: 2px solid {accent}; border-radius: 14px;}}
+            QLabel#brand {{font-size: 19px; font-weight: 750;}}
+            QLabel#hero {{font-size: 34px; font-weight: 750;}}
+            QLabel#heading {{font-size: 22px; font-weight: 700;}}
+            QLabel#strong {{font-size: 14px; font-weight: 700;}}
+            QLabel#muted {{color: {muted};}}
+            QLabel#credit {{color: {muted}; font-size: 11px;}}
+            QLabel#accent {{color: {accent}; font-weight: 700;}}
+            QPushButton, QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {{
+                background: {sub}; border: 1px solid {border}; border-radius: 8px; padding: 7px 10px;
+            }}
+            QPushButton:hover, QComboBox:hover {{background: {hover}; }}
+            QPushButton:pressed {{border-color: {accent};}}
+            QPushButton:disabled {{color: {muted}; background: {sub};}}
+            QPushButton#tab {{border-color: transparent; background: transparent; padding: 8px 14px;}}
+            QPushButton#tab:hover, QPushButton#tab:checked {{background: {hover}; color: {accent};}}
+            QPushButton:checked {{border-color: {accent};}}
+            QPushButton#primary {{background: #5944ca; color: white; font-weight: 700; border-color: #5944ca;}}
+            QPushButton#primary:hover {{background: #6953da;}}
+            QPushButton#primary:disabled {{background: {sub}; color: {muted}; border-color: {border};}}
+            QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBox:focus {{border-color: {accent};}}
+            QComboBox QAbstractItemView {{background: {surface}; selection-background-color: #5944ca; selection-color: white;}}
+            QComboBox {{padding-right: 22px;}}
+            QComboBox::drop-down {{subcontrol-origin: border; subcontrol-position: center right; width: 24px; border: 0; background: transparent;}}
+            QComboBox::down-arrow {{image: url("{chevron}"); width: 16px; height: 16px;}}
+            QScrollArea {{border: 0;}}
+            QScrollBar:vertical {{background: {sub}; width: 9px; margin: 0;}}
+            QScrollBar::handle:vertical {{background: {muted}; border-radius: 4px; min-height: 32px;}}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{height: 0;}}
+            QSlider::groove:horizontal {{height: 4px; background: {border}; border-radius: 2px;}}
+            QSlider::handle:horizontal {{background: {accent}; width: 13px; margin: -5px 0; border-radius: 6px;}}
+            QToolTip, QDialog, QMessageBox {{background: {surface}; color: {ink};}}
+        """)
+        for widget in self.findChildren(QPushButton):
+            self.decorate(widget)
+        for widget in self.findChildren(Picture):
+            self.decorate_picture(widget)
+
+    def decorate_picture(self, picture):
+        picture.canvas_color = QColor(self.canvas_color)
+        picture.text_color = QColor(self.muted)
+        picture.update()
+
+    def decorate(self, widget):
+        glyph = widget.property("glyph")
+        if glyph:
+            widget.setIcon(icon(glyph, "#ffffff" if widget.objectName() == "primary" else self.ink))
+            widget.setIconSize(QSize(17, 17))
+
+    def build_search(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        hero = panel()
+        contents = QVBoxLayout(hero)
+        contents.setContentsMargins(22, 16, 22, 16)
+        contents.addWidget(label("Find your next thumbnail", "hero"))
+        self.query = QLineEdit()
+        self.query.setPlaceholderText("Movie title, actor name or YouTube URL")
+        self.query.clearButtonEnabled = True
+        self.query.returnPressed.connect(self.start_search)
+        self.search_button = button("Search", self.start_search, "primary", "search")
+        search = row(self.query, self.search_button)
+        search.setStretch(0, 1)
+        contents.addLayout(search)
+        self.genre = QComboBox()
+        self.genre.addItems(["Category", "Action", "Comedy", "Drama", "Horror", "Romance", "Thriller", "Western"])
+        self.genre.setAccessibleName("Category")
+        self.genre.setMinimumWidth(135)
+        self.reference_button = button("Reference image", self.pick_reference, "", "image")
+        self.clear_reference = button("Clear", self.remove_reference)
+        self.clear_reference.hide()
+        filters = row(self.genre, self.reference_button, self.clear_reference)
+        filters.addStretch()
+        contents.addLayout(filters)
+        layout.addWidget(hero)
+        self.results_label = label("Results", "heading")
+        self.sort_label = label("By views", "muted")
+        self.sort_label.setToolTip("Sorts the fetched results only.")
+        self.sort_label.hide()
+        heading = row(self.results_label)
+        heading.addStretch()
+        heading.addWidget(self.sort_label)
+        layout.addLayout(heading)
+        self.result_scroll = QScrollArea()
+        self.result_scroll.setWidgetResizable(True)
+        self.result_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.result_scroll.verticalScrollBar().valueChanged.connect(self.check_scroll)
+        self.result_body = QWidget(objectName="scrollBody")
+        self.result_layout = QVBoxLayout(self.result_body)
+        self.result_layout.setContentsMargins(0, 0, 8, 0)
+        self.results_grid = QGridLayout()
+        self.results_grid.setSpacing(12)
+        self.result_layout.addLayout(self.results_grid)
+        self.empty = label("Search YouTube for movie thumbnails", "muted")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.result_layout.addWidget(self.empty, 1)
+        self.more = button("Load more", self.load_more)
+        self.more.hide()
+        self.result_layout.addWidget(self.more)
+        self.result_layout.addStretch()
+        self.result_scroll.setWidget(self.result_body)
+        layout.addWidget(self.result_scroll, 1)
+        return page
+
+    def build_create(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        composer = panel()
+        form = QVBoxLayout(composer)
+        form.setContentsMargins(20, 16, 20, 16)
+        title = row(label("Create a thumbnail", "heading"))
+        title.addStretch()
+        self.create_provider = QComboBox()
+        self.create_provider.addItems(["Cloudflare · Online", "ComfyUI · Local"])
+        self.create_provider.currentIndexChanged.connect(self.update_create_provider)
+        title.addWidget(self.create_provider)
+        title.addWidget(button("Model setup", self.open_model_setup))
+        form.addLayout(title)
+        self.create_prompt = QPlainTextEdit()
+        self.create_prompt.setPlaceholderText(
+            "Describe the scene, lighting, and expression you want. Mention what to keep from your references.")
+        self.create_prompt.setFixedHeight(94)
+        form.addWidget(self.create_prompt)
+
+        references = QHBoxLayout()
+        self.create_reference_buttons = []
+        self.create_clear_buttons = []
+        for index, role in enumerate(("Composition reference", "Cast reference")):
+            pick = button(role, partial(self.pick_create_reference, index), "", "image")
+            clear = button("Clear", partial(self.set_create_reference, index, ""))
+            clear.hide()
+            references.addWidget(pick)
+            references.addWidget(clear)
+            self.create_reference_buttons.append(pick)
+            self.create_clear_buttons.append(clear)
+        references.addStretch()
+        self.create_count = QComboBox()
+        self.create_count.addItems(["1 draft", "3 concepts"])
+        references.addWidget(self.create_count)
+        self.generate_button = button("Generate", self.generate_images, "primary", "create")
+        references.addWidget(self.generate_button)
+        self.stop_generation = button("Stop after current", self.stop_after_current)
+        self.stop_generation.hide()
+        form.addLayout(references)
+        layout.addWidget(composer)
+        self.create_status = label("", "muted")
+        self.create_status.setWordWrap(True)
+        status_line = row(self.create_status, self.stop_generation)
+        status_line.setStretch(0, 1)
+        layout.addLayout(status_line)
+        self.create_history = QComboBox()
+        self.create_history.setAccessibleName("Draft history")
+        self.create_history.currentIndexChanged.connect(self.open_draft_batch)
+        self.reuse_prompt = button("Reuse prompt", self.use_saved_prompt)
+        self.reuse_prompt.setEnabled(False)
+        history = row(self.create_history, self.reuse_prompt)
+        history.setStretch(0, 1)
+        layout.addLayout(history)
+
+        drafts = QHBoxLayout()
+        self.draft_cards, self.draft_images, self.draft_destinations = [], [], []
+        for index, letter in enumerate("ABC"):
+            card = panel()
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 12, 12, 12)
+            card_layout.addWidget(label(f"Draft {letter}", "strong"))
+            image = Picture(140)
+            card_layout.addWidget(image, 1)
+            destination = QComboBox()
+            destination.addItems(list("ABC"))
+            destination.setCurrentIndex(index)
+            send = button("Send to Edit", partial(self.send_draft, index), "", "edit")
+            card_layout.addLayout(row(destination, send))
+            drafts.addWidget(card, 1)
+            card.hide()
+            self.draft_cards.append(card)
+            self.draft_images.append(image)
+            self.draft_destinations.append(destination)
+        layout.addLayout(drafts, 1)
+        self.update_create_provider()
+        self.refresh_draft_history()
+        if self.create_history.count() > 1:
+            self.create_history.setCurrentIndex(1)
+        return page
+
+    def update_create_provider(self):
+        local = self.create_provider.currentIndex() == 1
+        for index, widget in enumerate(self.create_reference_buttons):
+            widget.setVisible(local)
+            self.create_clear_buttons[index].setVisible(local and bool(self.create_paths[index]))
+        self.create_prompt.setPlaceholderText(
+            "Describe the scene, lighting, and expression. Say what to keep from your references." if local
+            else "Describe a movie scene, the main subject, and the mood.")
+        self.create_status.setText("Start ComfyUI to generate with optional reference images." if local else
+                                   "Online text-to-image. Connect Cloudflare Workers AI in Settings.")
+
+    def open_model_setup(self):
+        url = comfy.SETUP_URL if self.create_provider.currentIndex() else (
+            "https://developers.cloudflare.com/workers-ai/get-started/rest-api/")
+        QDesktopServices.openUrl(QUrl(url))
+
+    def pick_create_reference(self, index):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a reference image", "",
+                                              "Images (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff)")
+        if path:
+            self.set_create_reference(index, path)
+
+    def set_create_reference(self, index, path):
+        self.create_paths[index] = path
+        role = ("Composition reference", "Cast reference")[index]
+        pick = self.create_reference_buttons[index]
+        pick.setText(f"{role.split()[0]} · {Path(path).name[:20]}" if path else role)
+        pick.setToolTip(path or role)
+        self.create_clear_buttons[index].setVisible(bool(path) and self.create_provider.currentIndex() == 1)
+
+    def generate_images(self):
+        if not self.generate_button.isEnabled():
+            return
+        prompt = self.create_prompt.toPlainText().strip()
+        if not prompt:
+            self.create_status.setText("Enter a prompt to generate a thumbnail.")
+            self.create_prompt.setFocus()
+            return
+        server = self.settings.value("create/server", comfy.DEFAULT_SERVER, type=str)
+        online = self.create_provider.currentIndex() == 0
+        account = self.settings.value("create/account", "", type=str)
+        token = os.environ.get("CLOUDFLARE_API_TOKEN") or self.settings.value("create/token", "", type=str)
+        references = tuple(zip(("composition reference", "cast reference"), self.create_paths))
+        count = (1, 3)[self.create_count.currentIndex()]
+        self.stop_batch.clear()
+        self.generate_button.setEnabled(False)
+        self.create_provider.setEnabled(False)
+        self.create_history.setEnabled(False)
+        self.reuse_prompt.setEnabled(False)
+        self.stop_generation.setVisible(count > 1)
+        self.stop_generation.setEnabled(True)
+        self.create_status.setText(f"Generating draft 1 of {count}…")
+        history_root = self.history_root
+
+        def generate():
+            outputs = []
+            error = None
+            save_error = None
+            folder = None
+            try:
+                with requests.Session() as session:
+                    session.trust_env = False
+                    if online:
+                        images = (services.cloud_image(account, token, f"{prompt} Cinematic YouTube movie thumbnail. {concept}")
+                                  for concept in (comfy.CONCEPTS if count == 3 else ("",))
+                                  if not self.create_stop.is_set())
+                    else:
+                        images = comfy.ComfyUI(server, self.create_stop, session).generate(prompt, references, count)
+                    for data in images:
+                        if data:
+                            outputs.append((data, self.draft_preview(data)))
+                            if save_error is None:
+                                try:
+                                    folder = services.save_draft(history_root, prompt, folder, len(outputs) - 1, data)
+                                except (OSError, ValueError) as failure:
+                                    save_error = f"Drafts are ready, but history could not be saved. {failure}"
+                            self.draft_ready.emit(tuple(outputs), count)
+                        if self.stop_batch.is_set():
+                            break
+            except Exception as failure:
+                error = str(failure)
+            return outputs, error or save_error, folder
+
+        self.task(generate, self.generation_ready)
+
+    def generation_ready(self, result, error):
+        self.generate_button.setEnabled(True)
+        self.create_provider.setEnabled(True)
+        self.create_history.setEnabled(True)
+        self.stop_generation.hide()
+        generated, problem, folder = result if result else ([], error, None)
+        if generated:
+            self.refresh_draft_history(folder)
+            self.display_drafts(generated)
+        self.reuse_prompt.setEnabled(bool(self.create_history.currentData()))
+        message = problem or f"{len(generated)} draft{'s' if len(generated) != 1 else ''} ready"
+        self.create_status.setText(message)
+        self.notice(message)
+
+    def show_generation_progress(self, generated, count):
+        self.display_drafts(generated)
+        if self.stop_batch.is_set():
+            self.create_status.setText("Finishing the current draft, then stopping…")
+        elif len(generated) < count:
+            self.create_status.setText(f"Generating draft {len(generated) + 1} of {count}…")
         else:
-            self.apply_theme(animate=False)
-        self.theme_preference = "dark" if self.dark else "light"
-        self.config["theme"] = self.theme_preference
-        self.config.pop("dark", None)
-        if not save_config(self.config):
-            self.status.setText("Theme changed for this session, but the preference could not be saved.")
+            self.create_status.setText("Saving drafts…")
 
-    def open_settings(self):
-        try:
-            d = SettingsDialog(self, self.download_dir)
-            if d.exec():
-                selected = d.download_path.text().strip()
-                if not selected:
-                    raise ValueError("Choose a valid download folder.")
-                self.download_dir = Path(selected).expanduser()
-                self.download_dir.mkdir(parents=True, exist_ok=True)
-                self.config["download_dir"] = str(self.download_dir)
-                if save_config(self.config):
-                    self.status.setText("Settings saved locally.")
-                else:
-                    self.status.setText("Settings could not be saved; check folder permissions.")
-        except Exception as exc:
-            logging.exception("Settings dialog failed")
-            QMessageBox.warning(self, "Settings error", str(exc))
-
-    def selected_min_minutes(self):
-        return 40
+    def stop_after_current(self):
+        self.stop_batch.set()
+        self.stop_generation.setEnabled(False)
+        self.create_status.setText("Finishing the current draft, then stopping…")
 
     @staticmethod
-    def classify_search_text(text):
-        """Lightweight local intent hint; YouTube results remain the source of truth."""
-        value = " ".join(text.strip().split())
-        low = value.casefold()
-        topic_terms = {
-            "action", "adventure", "comedy", "horror", "thriller", "romance",
-            "sci-fi", "science fiction", "space", "haunted", "survival",
-            "explained", "review", "edit", "scene", "scenes", "wallpaper",
-            "animation", "cartoon", "gaming", "nature", "travel", "tutorial",
-            "compilation", "best", "top"
-        }
-        if any(term in low for term in topic_terms):
-            return "topic"
-        words = value.split()
-        known_single_names = {"salman", "aamir", "akshay", "hrithik", "deepika",
-                              "ranbir", "ranveer", "prabhas", "vijay", "ajith",
-                              "rajini", "kamal", "mohanlal", "mammootty",
-                              "tom", "brad", "leonardo", "dwayne", "jackie"}
-        if len(words) == 1 and low in known_single_names:
-            return "actor"
-        # Multi-word proper-name-like phrases are treated as actor/person searches.
-        if 2 <= len(words) <= 4 and all(w[:1].isupper() for w in words if w):
-            return "actor"
-        return "topic"
+    def draft_preview(data):
+        image = ImageOps.fit(studio.open_image(data), (640, 360), method=Image.Resampling.LANCZOS)
+        return Window.preview_image(image)
 
-    def make_query(self):
-        if self.mode.currentIndex() == 0:
-            query = self.search_input.text().strip()
-            if not query:
-                raise ValueError("Enter an actor name, movie title or topic.")
-            intent = self.classify_search_text(query)
-            self.detected_search_intent = intent
-            if intent == "actor":
-                return f"{query} movies", ""
-            return f"{query} movie", ""
-        if not self.actor_image_path:
-            raise ValueError("Choose a reference thumbnail photo first.")
-        return "", self.actor_image_path
+    def refresh_draft_history(self, folder=None):
+        self.create_history.blockSignals(True)
+        self.create_history.clear()
+        self.create_history.addItem("Draft history")
+        for path, prompt, count in services.batches(self.history_root):
+            stamp = path.name[:17].replace("_", " ")
+            self.create_history.addItem(f"{stamp[:13]}:{stamp[13:15]} · {prompt[:66]}", (str(path), count, prompt))
+            if path == folder:
+                self.create_history.setCurrentIndex(self.create_history.count() - 1)
+        self.create_history.blockSignals(False)
+
+    def open_draft_batch(self, index):
+        item = self.create_history.itemData(index)
+        self.reuse_prompt.setEnabled(bool(item))
+        if not item:
+            return
+        folder, count, _ = item
+
+        def load():
+            data = [(Path(folder) / f"{number}.png").read_bytes() for number in range(count)]
+            return [(image, self.draft_preview(image)) for image in data]
+
+        def ready(result, error):
+            if self.generate_button.isEnabled() and self.create_history.currentData() == item:
+                if error:
+                    self.create_status.setText(error)
+                else:
+                    self.display_drafts(result)
+                    self.create_status.setText("Saved drafts")
+
+        self.task(load, ready)
+
+    def use_saved_prompt(self):
+        item = self.create_history.currentData()
+        if item:
+            self.create_prompt.setPlainText(item[2])
+            self.create_prompt.setFocus()
+
+    def display_drafts(self, generated):
+        self.create_outputs = [data for data, _ in generated]
+        for index, card in enumerate(self.draft_cards):
+            card.setVisible(index < len(generated))
+            if index < len(generated):
+                self.draft_images[index].set_data(generated[index][1])
+
+    def send_draft(self, index):
+        if index >= len(self.create_outputs):
+            return
+        slot = self.draft_destinations[index].currentIndex()
+        if self.candidates[slot].source:
+            answer = QMessageBox.question(self, "Replace candidate",
+                                          f"Replace candidate {'ABC'[slot]} and its adjustments?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.install_source(slot, self.create_outputs[index], f"Generated draft {'ABC'[index]}")
+        self.show_page(2)
 
     def start_search(self):
-        self.set_browse_compact(False)
-        self.scroll.verticalScrollBar().setValue(0)
-        try:
-            query, image_path = self.make_query()
-        except ValueError as e:
-            QMessageBox.warning(self, "Missing search input", str(e))
+        query = self.query.text().strip()
+        direct = video_id(query)
+        if ("://" in query or query.lower().startswith(("youtu.be/", "youtube.com/", "www.youtube.com/"))) and not direct:
+            self.notice("Enter a valid YouTube video URL.")
             return
-        if not self.api_key and not self.prompt_for_api_key():
+        if not self.youtube.keys:
+            self.notice("Add a YouTube Data API key in Settings to search.")
             return
-        self.last_query = query
-        self.search_image_path = image_path
-        self.search_folder_name = query or ("similar_thumbnails_" + Path(image_path).stem)
-        self.min_duration_minutes = 40
-        self.movie_genre = (
-            (self.genre_choice.currentData() or "Any genre")
-            if self.mode.currentIndex() == 0 and self.genre_toggle.isChecked() else "Any genre"
-        )
-        self.config.pop("min_duration_minutes", None)
-        self.config["movie_genre"] = self.movie_genre
-        self.config.pop("search_language", None)
-        self.config.pop("search_region", None)
-        if not save_config(self.config):
-            self.status.setText("Search preferences could not be saved; continuing with current selections.")
-        self.next_token = ""; self.seen_ids.clear(); self.pending_items=[]; self.current_batch=[]
-        self.loading_more = False; self.has_more_pages = False
-        self.clear_gallery()
-        self._visible_cards = []
-        self.run_search("")
+        if not query and self.reference is None:
+            self.notice("Enter a movie or actor name, paste a YouTube URL, or add a reference image.")
+            return
+        self.search_generation += 1
+        self.search_pool.clear()
+        self.image_pool.clear()
+        self.tasks = {task for task in self.tasks if not task.is_search}
+        for card in self.cards.values():
+            self.results_grid.removeWidget(card)
+            card.hide()
+            card.deleteLater()
+        self.cards.clear()
+        self.results.clear()
+        self.rank.clear()
+        self.next_token = None
+        self.empty_pages = 0
+        self.search_args = (query, 40, "" if self.genre.currentIndex() == 0 else self.genre.currentText())
+        self.active_reference = self.reference
+        self.sort_label.setText("By visual similarity" if self.active_reference else "By views")
+        self.sort_label.hide()
+        self.results_label.setText("Results")
+        self.fetch_page(None)
 
-    def search_single_video(self, video_id):
-        self.loading_more = True
-        self.search_btn.setEnabled(False)
-        self.set_loading_state(True, "Fetching video thumbnail")
-        if not hasattr(self, "_video_bridge"):
-            from PySide6.QtCore import QObject, Signal
-            class Bridge(QObject):
-                done = Signal(object, object)
-            self._video_bridge = Bridge(self)
-            self._video_bridge.done.connect(self._single_video_finished)
-        threading.Thread(target=lambda: self._video_bridge.done.emit(*self._fetch_video(video_id)), daemon=True).start()
+    def fetch_page(self, token):
+        self.searching = True
+        self.more.hide()
+        self.empty.setVisible(not self.results)
+        self.empty.setText("Searching YouTube…")
+        self.notice("Searching YouTube…")
+        generation = self.search_generation
+        client, args = self.youtube, self.search_args
+        self.task(lambda: client.page(*args, token=token),
+                  partial(self.page_ready, generation, token), self.search_pool)
 
-    def _fetch_video(self, video_id):
-        try:
-            response = requests.get("https://www.googleapis.com/youtube/v3/videos",
-                params={"part":"snippet,statistics,contentDetails","id":video_id,"key":self.api_key}, timeout=(5,20))
-            response.raise_for_status()
-            items=response.json().get("items", [])
-            if not items: raise ValueError("YouTube video was not found or is unavailable.")
-            item=items[0]; sn=item.get("snippet",{}); thumbs=sn.get("thumbnails",{})
-            quality=next((k for k in ("maxres","standard","high","medium","default") if thumbs.get(k,{}).get("url")),"default")
-            stats=item.get("statistics",{})
-            return ({"id":video_id,"title":sn.get("title","Untitled"),"channel":sn.get("channelTitle",""),
-                "published":sn.get("publishedAt","")[:10],"views":int(stats.get("viewCount",0)),
-                "thumbnail":thumbs.get(quality,{}).get("url",""),"thumbnail_quality":quality,
-                "duration":parse_youtube_duration(item.get("contentDetails",{}).get("duration","")),
-                "video_url":"https://www.youtube.com/watch?v="+video_id}, None)
-        except Exception as exc:
-            return None, str(exc)
-
-    def _single_video_finished(self, item, error):
-        self.set_loading_state(False); self.loading_more=False; self.search_btn.setEnabled(True)
+    def page_ready(self, generation, token, result, error):
+        if generation != self.search_generation:
+            return
+        self.searching = False
         if error:
-            self.status.setText("Could not load video")
-            QMessageBox.warning(self, "Video link", error); return
-        self.clear_gallery(); self._visible_cards=[]; self.add_cards([item])
-        self.seen_ids={item["id"]}; self.result_label.setText("Video thumbnail")
-        self.status.setText("Thumbnail ready"); self.download_all_btn.setEnabled(True); self.has_more_pages=False
-
-    def next_batch(self):
-        if self.loading_more or not self.has_more_pages:
+            self.next_token = token
+            self.more.setVisible(bool(token))
+            self.empty.setText(error)
+            self.notice(error)
             return
-        limit = BATCH_SIZE
-        if len(self.pending_items) >= limit:
-            self.show_next_results()
-        elif self.next_token:
-            self.run_search(self.next_token)
-        else:
-            self.has_more_pages = False
+        videos, next_token = result
+        self.next_token = next_token if next_token != token else None
+        previous = len(self.results)
+        for video in videos:
+            if video.id in self.results:
+                continue
+            self.results[video.id] = video
+            self.add_card(video, generation)
+        self.arrange_cards()
+        count = len(self.results)
+        self.sort_label.setVisible(bool(count))
+        self.results_label.setText(f"Results  ·  {count:,}")
+        self.empty.setVisible(not count)
+        self.empty.setText("No matching videos in the fetched results")
+        self.more.setVisible(bool(self.next_token))
+        self.notice(f"{count:,} fetched result{'s' if count != 1 else ''}")
+        if count == previous and self.next_token and self.empty_pages < 2:
+            self.empty_pages += 1
+            QTimer.singleShot(0, self.load_more)
 
-    def run_search(self, token):
-        try:
-            self.loading_more = True
-            self.search_btn.setEnabled(False)
-            self.set_loading_state(True, "Searching YouTube thumbnails…")
-            worker = SearchWorker(
-                self.api_key, self.last_query, token, BATCH_SIZE,
-                self.min_duration_minutes, self.search_image_path, self.movie_genre
-            )
-            self.search_workers.append(worker)
-            worker.signals.finished.connect(
-                lambda data, error, w=worker: self._search_worker_finished(w, data, error))
-            worker.signals.progress.connect(self.status.setText)
-            self.pool.start(worker)
-        except Exception as exc:
-            self.loading_more = False
-            self.set_loading_state(False)
-            self.search_btn.setEnabled(True)
-            logging.exception("Could not start movie search")
-            QMessageBox.critical(self, "Search could not start", str(exc))
+    def check_scroll(self, value):
+        limit = self.result_scroll.verticalScrollBar().maximum()
+        if limit > 0 and value >= limit - 120:
+            self.load_more()
 
-    def _search_worker_finished(self, worker, data, error):
-        if worker in self.search_workers:
-            self.search_workers.remove(worker)
-        self.search_finished(data, error)
+    def load_more(self):
+        if not self.searching and self.next_token:
+            self.fetch_page(self.next_token)
 
-    def search_finished(self, data, error):
-        self.set_loading_state(False)
-        self.search_btn.setEnabled(True)
-        self.loading_more = False
+    def pick_reference(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose reference image", "", "Images (*.jpg *.jpeg *.png *.webp *.bmp)")
+        if path:
+            self.reference_button.setEnabled(False)
+            self.task(lambda: signature(Path(path).read_bytes()), partial(self.reference_ready, path))
+
+    def reference_ready(self, path, data, error):
+        self.reference_button.setEnabled(True)
         if error:
-            self.has_more_pages = False
-            self.status.setText("Search failed.")
-            QMessageBox.critical(self,"YouTube search error",error+"\n\nCheck your internet connection and YouTube API configuration/quota.")
+            self.notice(error)
             return
-        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-            logging.error("Search worker returned an invalid response: %r", data)
-            self.status.setText("Search returned an invalid response. Please try again.")
-            QMessageBox.warning(self, "Search error", "The search returned an unexpected response. See the diagnostic log.")
+        self.reference = data
+        self.reference_button.setText(Path(path).name[:24])
+        self.clear_reference.show()
+        self.notice("Reference ready. Search to rank fetched thumbnails by visual similarity.")
+
+    def remove_reference(self):
+        self.reference = None
+        self.reference_button.setText("Reference image")
+        self.clear_reference.hide()
+        self.notice("Reference cleared for the next search.")
+
+    def add_card(self, video, generation):
+        card = panel()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 10, 10, 10)
+        image = Picture(136)
+        self.decorate_picture(image)
+        image.setFixedHeight(136)
+        image.set_data(None, "Loading thumbnail…")
+        layout.addWidget(image)
+        title = label(video.title, "strong")
+        title.setWordWrap(True)
+        title.setMinimumHeight(35)
+        title.setToolTip(video.title)
+        layout.addWidget(title)
+        caption = label(f"{video.channel}  ·  {video.date}", "muted")
+        caption.setWordWrap(True)
+        layout.addWidget(caption)
+        layout.addWidget(label(f"{video.views:,} views", "muted"))
+        layout.addStretch()
+        actions = row(button("Save", partial(self.video_action, video, False), "", "save"),
+                      button("Watch", lambda: QDesktopServices.openUrl(QUrl(video.url)), "", "watch"),
+                      button("Edit", partial(self.video_action, video, True), "", "edit"))
+        for index in range(actions.count()):
+            self.decorate(actions.itemAt(index).widget())
+        layout.addLayout(actions)
+        self.cards[video.id] = card
+        reference = self.active_reference
+
+        def load():
+            data = thumbnail(video, preview=True)
+            return QImage.fromData(data), distance(reference, signature(data)) if reference else 0
+
+        self.task(load, partial(self.card_ready, generation, video.id, image), self.image_pool)
+
+    def card_ready(self, generation, key, image, result, error):
+        if generation != self.search_generation:
             return
-        known = self.seen_ids | {x["id"] for x in self.pending_items}
-        self.pending_items.extend(x for x in data["items"] if x.get("id") and x["id"] not in known)
-        self.next_token = data["next"]
-        self.has_more_pages = bool(self.pending_items or self.next_token)
-        if len(self.pending_items) >= BATCH_SIZE or not self.next_token:
-            self.show_next_results()
-        else:
-            self.run_search(self.next_token)
-
-    def show_next_results(self):
-        fresh=self.pending_items[:BATCH_SIZE]
-        self.pending_items=self.pending_items[BATCH_SIZE:]
-        self.seen_ids.update(x["id"] for x in fresh)
-        self.add_cards(fresh)
-        mode_name = ("similar thumbnails" if self.search_image_path else
-                     ("actor-related movies" if getattr(self, "detected_search_intent", "topic") == "actor" else "movie/topic results"))
-        self.result_label.setText(f"{len(self.seen_ids)} {mode_name} found  ·  popular movies first")
-        self.status.setText(f"Showing {len(fresh)} popular movies ({self.min_duration_minutes} min+). Scroll for more.")
-        self.download_all_btn.setEnabled(bool(self.seen_ids))
-        self.has_more_pages = bool(self.pending_items or self.next_token)
-        if not fresh and self.next_token:
-            self.run_search(self.next_token)
-        elif not fresh and not self.seen_ids:
-            self.status.setText("No matching videos found. Try another search, genre or a shorter minimum duration.")
-            self.result_label.setText("No matching videos found")
-            empty = QFrame(); empty.setObjectName("Panel")
-            box = QVBoxLayout(empty); box.setAlignment(Qt.AlignCenter)
-            title = QLabel("No thumbnails found this time")
-            title.setStyleSheet("font-size:14pt;font-weight:800;background:transparent;")
-            detail = QLabel("Try another actor, topic, genre or reference image.")
-            detail.setWordWrap(True); detail.setAlignment(Qt.AlignCenter); detail.setObjectName("Muted")
-            box.addWidget(title); box.addWidget(detail)
-            self.grid.addWidget(empty, 0, 0, 1, 4)
-        QTimer.singleShot(180, self.try_auto_load)
-
-    def try_auto_load(self):
-        if not self.has_more_pages or self.loading_more or not self.auto_load_enabled:
+        if error:
+            image.set_data(None, "Thumbnail unavailable")
             return
-        bar = self.scroll.verticalScrollBar()
-        # Fill a short viewport automatically; otherwise load when near its bottom.
-        if bar.maximum() == 0 or bar.maximum() - bar.value() <= max(100, int(bar.pageStep() * 0.22)):
-            self.next_batch()
+        pixmap, rank = result
+        image.set_data(pixmap)
+        if self.active_reference:
+            self.rank[key] = rank
+            if not self.rank_timer.isActive():
+                self.rank_timer.start()
 
-    def clear_gallery(self):
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        self.result_label.setText("Finding matching thumbnails…")
-        self.download_all_btn.setEnabled(False)
-
-    def add_cards(self, items):
-        self._visible_cards = getattr(self, "_visible_cards", [])
-        new_cards = [ThumbCard(item, self) for item in items]
-        self._visible_cards.extend(new_cards)
-        for card in new_cards:
-            effect = QGraphicsOpacityEffect(card); card.setGraphicsEffect(effect); effect.setOpacity(0.0)
-            anim = QPropertyAnimation(effect, b"opacity", card); anim.setDuration(300)
-            anim.setStartValue(0.0); anim.setEndValue(1.0); anim.setEasingCurve(QEasingCurve.OutQuart)
-            card._entry_animation = anim; anim.start()
-        self.reflow_gallery(); self.current_batch = items
-
-    def reflow_gallery(self):
-        cards = getattr(self, "_visible_cards", [])
-        if not cards:
-            return
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            # Keep the widgets alive while moving them to their new positions.
-        width = max(260, self.scroll.viewport().width())
-        columns = max(1, min(4, width // 285))
-        for col in range(4):
-            self.grid.setColumnStretch(col, 1 if col < columns else 0)
-        for i, card in enumerate(cards):
-            self.grid.addWidget(card, i // columns, i % columns)
+    def arrange_cards(self):
+        columns = 3 if self.width() >= 1050 else 2
+        self.columns = columns
+        ordered = sorted(self.results.values(), key=lambda video: (self.rank.get(video.id, 2), -video.views))
+        for card in self.cards.values():
+            self.results_grid.removeWidget(card)
+        for index, video in enumerate(ordered):
+            self.results_grid.addWidget(self.cards[video.id], index // columns, index % columns)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if hasattr(self, "centralWidget") and self.centralWidget():
-            compact = self.width() < 850
-            margins = (14, 12, 14, 12) if compact else (24, 20, 24, 18)
-            layout = self.centralWidget().layout()
-            if layout:
-                layout.setContentsMargins(*margins)
-                layout.setSpacing(12 if compact else 18)
-            if hasattr(self, "search_btn"):
-                self.search_btn.setMinimumWidth(150 if compact else 190)
-        if hasattr(self, "_visible_cards"):
-            self.reflow_gallery()
+        if hasattr(self, "results_grid") and self.results and self.columns != (3 if self.width() >= 1050 else 2):
+            self.arrange_cards()
 
-    def open_thumbnail_editor(self, item):
-        """Download the selected thumbnail locally, then open the non-destructive editor."""
-        try:
-            from .editor import ThumbnailEditor
-            response = requests.get(item.get("thumbnail", ""), timeout=(5, 25))
-            response.raise_for_status()
-            from PIL import Image
-            from io import BytesIO
-            handle = tempfile.NamedTemporaryFile(prefix="thumb_finder_edit_", suffix=".jpg", delete=False)
-            temp_path = Path(handle.name)
-            handle.close()
-            with Image.open(BytesIO(response.content)) as source:
-                source.convert("RGB").save(temp_path, format="JPEG", quality=95)
-            dialog = ThumbnailEditor(temp_path, self)
-            dialog.exec()
-        except Exception as exc:
-            logging.exception("Could not open thumbnail editor")
-            QMessageBox.warning(self, "Editor unavailable", f"Could not download or open this thumbnail.\n\n{exc}")
-
-    def download_item(self, item):
-        self.start_download([item])
-    def download_all(self):
-        items=[card.item for card in getattr(self, "_visible_cards", [])]
-        if items: self.start_download(items)
-    def start_download(self, items):
-        try:
-            folder = self.download_dir / self.safe_name(
-                self.search_folder_name or self.last_query or "similar_thumbnails")
-            worker = DownloadWorker(items, folder)
-            self.download_workers.append(worker)
-            worker.signals.done.connect(self.download_finished)
-            worker.signals.done.connect(
-                lambda _a, _b, w=worker: self.download_workers.remove(w)
-                if w in self.download_workers else None)
-            self.status.setText("Downloading thumbnails in background…")
-            self.pool.start(worker)
-        except Exception as exc:
-            logging.exception("Could not start thumbnail download")
-            QMessageBox.warning(self, "Download error", str(exc))
-    def download_finished(self, message, error):
-        self.status.setText(message)
-        if error:
-            QMessageBox.warning(self, "Download failed", error)
+    def video_action(self, video, to_editor):
+        slot = self.active
+        if to_editor:
+            dialog = QDialog(self, windowTitle="Choose candidate")
+            form = QFormLayout(dialog)
+            combo = QComboBox()
+            combo.addItems(list("ABC"))
+            combo.setCurrentIndex(slot)
+            form.addRow("Send thumbnail to", combo)
+            actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            actions.accepted.connect(dialog.accept)
+            actions.rejected.connect(dialog.reject)
+            form.addRow(actions)
+            if not dialog.exec():
+                return
+            slot = combo.currentIndex()
+        expected = self.candidates[slot]
+        self.notice("Downloading best available source…")
+        cached = self.cache.get(video.id)
+        if cached:
+            self.cache.move_to_end(video.id)
+            self.video_ready(video, to_editor, slot, expected, cached, None)
         else:
-            folder = self.download_dir / self.safe_name(
-                self.search_folder_name or self.last_query or "similar_thumbnails")
-            QMessageBox.information(self, "Download complete", f"{message}\nSaved to:\n{folder}")
+            self.task(partial(thumbnail, video), partial(self.video_ready, video, to_editor, slot, expected))
 
-    def set_browse_compact(self, compact):
-        """Collapse the search area into a slim expandable bar while browsing."""
-        compact = bool(compact)
-        if compact == getattr(self, "_browse_compact", False):
+    def video_ready(self, video, to_editor, slot, expected, data, error):
+        if error:
+            self.notice(error)
             return
-        self._browse_compact = compact
-        self.top_widget.setVisible(not compact)
-        self.hero_widget.setVisible(False)
-        self.results_header_widget.setVisible(not compact)
-        self.status_panel.setVisible(not compact)
-        self.footer_widget.setVisible(not compact)
-        self.search_top_widget.setVisible(not compact)
-        self.compact_search_btn.setVisible(compact)
-        self.mode.setVisible(not compact)
-        self.search_input.setVisible(not compact and self.mode.currentIndex() == 0)
-        self.image_row_widget.setVisible(not compact and self.mode.currentIndex() == 1)
-        self.filter_row_widget.setVisible(not compact)
-        # Language/region controls were removed; older layouts may not define this row.
-        locale_row = getattr(self, "locale_row_widget", None)
-        if locale_row is not None:
-            locale_row.setVisible(not compact)
-        self.genre_filter_widget.setVisible(not compact and self.mode.currentIndex() == 0)
-        margins = (8, 5, 8, 5) if compact else ((14, 12, 14, 12) if self.width() < 850 else (24, 20, 24, 18))
-        central_layout = self.centralWidget().layout()
-        central_layout.setContentsMargins(*margins)
-        central_layout.setSpacing(5 if compact else (12 if self.width() < 850 else 18))
-        if hasattr(self, "search_panel_layout"):
-            self.search_panel_layout.setContentsMargins(10, 5, 10, 5) if compact else self.search_panel_layout.setContentsMargins(20, 18, 20, 18)
-            self.search_panel_layout.setSpacing(5 if compact else 13)
-        # Animate the compact search panel height for a smooth collapse/expand.
-        panel = self.search_panel
-        if hasattr(self, "_search_panel_anim") and self._search_panel_anim:
-            self._search_panel_anim.stop()
-        from PySide6.QtCore import QPropertyAnimation, QEasingCurve
-        target = 54 if compact else panel.sizeHint().height()
-        panel.setMaximumHeight(16777215 if not compact else max(panel.height(), target))
-        anim = QPropertyAnimation(panel, b"maximumHeight", self)
-        anim.setDuration(280)
-        anim.setStartValue(panel.height())
-        anim.setEndValue(target)
-        anim.setEasingCurve(QEasingCurve.OutQuart)
-        if not compact:
-            anim.finished.connect(lambda: panel.setMaximumHeight(16777215))
-        self._search_panel_anim = anim
-        anim.start()
+        if video.id not in self.cache:
+            self.cache[video.id] = data
+            self.cache_bytes += len(data)
+            while self.cache_bytes > 32 * 1024 * 1024:
+                _, discarded = self.cache.popitem(last=False)
+                self.cache_bytes -= len(discarded)
+        if to_editor:
+            if self.candidates[slot] is not expected:
+                self.notice("Candidate changed during download. Send the image again to replace it.")
+                return
+            self.install_source(slot, data, video.title)
+            self.show_page(2)
+            return
+        image = QImage.fromData(data)
+        extension = ".png" if data.startswith(b"\x89PNG") else ".webp" if data.startswith(b"RIFF") else ".jpg"
+        path, _ = QFileDialog.getSaveFileName(self, "Save original thumbnail", video.id + extension,
+                                              f"Original thumbnail (*{extension})")
+        if path:
+            self.task(lambda: Path(path).write_bytes(data), lambda _, err: self.notice(
+                err or f"Saved source · {image.width()} × {image.height()}"))
 
-    def on_gallery_scroll(self, value):
-        # Collapse surrounding chrome with a short height animation and preserve scroll position.
-        was_compact = getattr(self, "_browse_compact", False)
-        should_compact = value > 35
-        if should_compact != was_compact:
-            bar = self.scroll.verticalScrollBar()
-            self.set_browse_compact(should_compact)
-            bar.setValue(min(value, bar.maximum()))
-        if self.loading_more or not self.auto_load_enabled or not self.has_more_pages:
+    def build_editor(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        heading = row(label("Thumbnail studio", "heading"))
+        heading.addStretch()
+        self.movie = QLineEdit(placeholderText="Movie or project name")
+        self.movie.setMinimumWidth(180)
+        heading.addWidget(self.movie)
+        self.export_button = button("Export A/B/C", self.export_candidates, "", "save")
+        heading.addWidget(self.export_button)
+        self.download_button = button("Download A", self.download_candidate, "primary", "save")
+        self.download_button.setToolTip("Save the active candidate as a JPG.")
+        heading.addWidget(self.download_button)
+        layout.addLayout(heading)
+
+        cards = QHBoxLayout()
+        self.slot_cards, self.slot_images, self.slot_select = [], [], []
+        for slot, letter in enumerate("ABC"):
+            card = panel()
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(9, 8, 9, 8)
+            image = Picture(82)
+            image.setMaximumHeight(111)
+            image.set_data(None, "No source")
+            card_layout.addWidget(image)
+            select = button(f"Edit {letter}", partial(self.select_slot, slot))
+            select.setCheckable(True)
+            self.slot_select.append(select)
+            card_layout.addLayout(row(select, button("Load image", partial(self.load_source, slot), "", "image")))
+            cards.addWidget(card, 1)
+            self.slot_cards.append(card)
+            self.slot_images.append(image)
+        layout.addLayout(cards)
+
+        content = QHBoxLayout()
+        left = panel()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 10, 12, 10)
+        self.active_label = label("Candidate A", "strong")
+        left_layout.addWidget(self.active_label)
+        self.preview = Picture(220)
+        self.preview.set_data(None, "Load an image to start editing")
+        self.preview.selected.connect(self.remove_region)
+        left_layout.addWidget(self.preview, 1)
+        self.before = QCheckBox("Before adjustments")
+        self.before.toggled.connect(self.before_toggled)
+        self.small = QCheckBox("Small preview")
+        self.small.toggled.connect(self.set_small)
+        tools = row(self.before, self.small)
+        tools.addStretch()
+        left_layout.addLayout(tools)
+        content.addWidget(left, 3)
+
+        right = panel()
+        right.setMinimumWidth(360)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(10, 10, 10, 10)
+        self.auto_button = button("Auto Adjust", self.auto_adjust, "primary", "create")
+        self.auto_button.setMinimumWidth(108)
+        self.remove_mode = QComboBox()
+        self.remove_mode.addItems(["Remove", "Rectangle", "Brush"])
+        self.remove_mode.setAccessibleName("Object or text remover")
+        self.remove_mode.setMinimumWidth(112)
+        self.remove_mode.currentIndexChanged.connect(self.toggle_remove)
+        self.enhance_button = button("Enhance", self.enhance, "", "image")
+        self.enhance_button.setToolTip("Upscale this candidate to 1920 × 1080 using the optional local AI tools.")
+        right_layout.addLayout(row(self.auto_button, self.remove_mode, self.enhance_button))
+        self.brush_width = QSpinBox()
+        self.brush_width.setRange(1, 18)
+        self.brush_width.setValue(4)
+        self.brush_width.setPrefix("Brush ")
+        self.brush_width.setSuffix("%")
+        self.brush_width.valueChanged.connect(self.change_brush_width)
+        self.brush_width.hide()
+        self.preview.brush = 0.04
+        right_layout.addWidget(self.brush_width)
+        self.remove_actions = QWidget()
+        selection_buttons = QHBoxLayout(self.remove_actions)
+        selection_buttons.setContentsMargins(0, 0, 0, 0)
+        self.apply_remove = button("Apply removal", self.apply_selection, "primary")
+        self.undo_mark = button("Undo mark", self.undo_selection)
+        self.clear_marks = button("Clear", self.clear_selection)
+        for widget in (self.apply_remove, self.undo_mark, self.clear_marks):
+            selection_buttons.addWidget(widget)
+        self.remove_actions.hide()
+        right_layout.addWidget(self.remove_actions)
+        self.undo_button = button("Undo", partial(self.history, True))
+        self.redo_button = button("Redo", partial(self.history, False))
+        self.reset_button = button("Reset", self.reset)
+        right_layout.addLayout(row(self.undo_button, self.redo_button, self.reset_button))
+        advanced = button("Manual adjustments", lambda checked: scroll.setVisible(checked))
+        advanced.setCheckable(True)
+        right_layout.addWidget(advanced)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls = QWidget(objectName="scrollBody")
+        self.form = QFormLayout(controls)
+        self.form.setContentsMargins(10, 8, 10, 8)
+        self.control_fields = {}
+        for name, low, high in (("Crop horizontal", 0, 100), ("Crop vertical", 0, 100),
+                                ("Crop zoom", 100, 220), *((name, -100, 100) for name in studio.ADJUSTMENTS),
+                                ("JPEG quality", 70, 100)):
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(low, high)
+            value = label("", "muted")
+            value.setFixedWidth(30)
+            slider.valueChanged.connect(partial(self.slider_change, name))
+            slider.sliderReleased.connect(self.commit)
+            self.control_fields[name] = (slider, value)
+            track = row(slider, value)
+            track.setStretch(0, 1)
+            self.form.addRow(name, track)
+        self.overlay = QLineEdit(placeholderText="Optional title")
+        self.overlay.setMaxLength(70)
+        self.overlay.textChanged.connect(self.overlay_change)
+        self.overlay.editingFinished.connect(self.commit)
+        self.form.addRow("Text overlay", self.overlay)
+        scroll.setWidget(controls)
+        scroll.hide()
+        right_layout.addWidget(scroll, 1)
+        right_layout.addStretch()
+        content.addWidget(right, 2)
+        layout.addLayout(content, 1)
+        return page
+
+    def load_source(self, slot):
+        path, _ = QFileDialog.getOpenFileName(self, f"Load candidate {'ABC'[slot]}", "",
+                                              "Images (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff)")
+        if path:
+            expected = self.candidates[slot]
+
+            def load():
+                data = Path(path).read_bytes()
+                studio.open_image(data)
+                return data
+
+            self.notice("Loading image…")
+            self.task(load, partial(self.local_ready, slot, expected, Path(path).name))
+
+    def local_ready(self, slot, expected, filename, data, error):
+        if error:
+            self.notice(error)
+        elif self.candidates[slot] is expected:
+            self.install_source(slot, data, filename)
+        else:
+            self.notice("Candidate changed while loading. Choose the image again to replace it.")
+
+    def install_source(self, slot, data, filename):
+        self.commit()
+        self.candidates[slot] = studio.Candidate(data, filename)
+        self.slot_images[slot].set_data(None, "Rendering…")
+        self.select_slot(slot, commit=False)
+        self.notice(f"Candidate {'ABC'[slot]} loaded · {filename}")
+
+    def select_slot(self, slot, commit=True):
+        if commit:
+            self.commit()
+        self.active = slot
+        self.clear_selection()
+        self.before.setChecked(False)
+        self.remove_mode.setCurrentIndex(0)
+        self.preview.set_data(None, "Rendering…" if self.candidates[slot].source else "Load an image to start editing")
+        self.sync_editor()
+
+    def sync_editor(self):
+        candidate = self.candidates[self.active]
+        self.draft = candidate.edit
+        self.active_label.setText(f"Candidate {'ABC'[self.active]}" + (f"  ·  {candidate.filename[:65]}" if candidate.source else ""))
+        for index, card in enumerate(self.slot_cards):
+            card.setObjectName("picked" if index == self.active else "surface")
+            card.style().unpolish(card)
+            card.style().polish(card)
+            self.slot_select[index].setChecked(index == self.active)
+        special = {"Crop horizontal": self.draft.crop, "Crop vertical": self.draft.vertical,
+                   "Crop zoom": self.draft.zoom, "JPEG quality": self.draft.quality}
+        for name, (widget, value) in self.control_fields.items():
+            number = special.get(name, self.draft.values.get(name, 0))
+            widget.blockSignals(True)
+            widget.setValue(number)
+            widget.blockSignals(False)
+            locked = bool(self.draft.repaired) and name.startswith("Crop ")
+            widget.setEnabled(bool(candidate.source) and not locked)
+            widget.setToolTip("Undo or reset the AI edit to adjust the crop." if locked else "")
+            value.setText(str(number))
+        self.overlay.blockSignals(True)
+        self.overlay.setText(self.draft.text)
+        self.overlay.blockSignals(False)
+        for widget in (self.overlay, self.before, self.small, self.auto_button, self.reset_button):
+            widget.setEnabled(bool(candidate.source))
+        self.update_actions()
+        self.queue_preview()
+
+    def update_actions(self):
+        candidate = self.candidates[self.active]
+        self.undo_button.setEnabled(bool(candidate.undo) or candidate.edit != self.draft)
+        self.redo_button.setEnabled(bool(candidate.redo) and candidate.edit == self.draft)
+        self.remove_mode.setEnabled(bool(candidate.source) and not self.offline_busy)
+        self.enhance_button.setEnabled(bool(candidate.source) and not self.offline_busy and not self.draft.enhanced)
+        self.enhance_button.setText("1080p ready" if self.draft.enhanced else "Enhance")
+        self.download_button.setText(f"Download {'ABC'[self.active]}")
+        self.download_button.setEnabled(bool(candidate.source) and not self.downloading and not self.offline_busy)
+        for widget in (self.apply_remove, self.undo_mark, self.clear_marks):
+            widget.setEnabled(bool(self.remove_selections) and not self.offline_busy)
+        if not getattr(self, "exporting", False):
+            self.export_button.setEnabled(all(candidate.source for candidate in self.candidates))
+
+    def slider_change(self, name, value):
+        self.control_fields[name][1].setText(str(value))
+        attribute = {"Crop horizontal": "crop", "Crop vertical": "vertical", "Crop zoom": "zoom",
+                     "JPEG quality": "quality"}.get(name)
+        if attribute:
+            if attribute != "quality" and self.remove_selections:
+                self.clear_selection()
+            self.draft = replace(self.draft, **{attribute: value})
+        else:
+            self.draft = replace(self.draft, values={**self.draft.values, name: value})
+        self.update_actions()
+        self.queue_preview()
+        if not self.control_fields[name][0].isSliderDown():
+            self.commit()
+
+    def overlay_change(self, value):
+        self.draft = replace(self.draft, text=value)
+        self.update_actions()
+        self.queue_preview()
+
+    def commit(self):
+        if hasattr(self, "draft"):
+            self.candidates[self.active].change(self.draft)
+            self.update_actions()
+
+    def history(self, backwards):
+        self.commit()
+        self.clear_selection()
+        self.candidates[self.active].step(backwards)
+        self.sync_editor()
+
+    def reset(self):
+        self.commit()
+        self.clear_selection()
+        self.candidates[self.active].change(studio.Edit())
+        self.sync_editor()
+
+    def auto_adjust(self):
+        self.commit()
+        slot = self.active
+        candidate = self.candidates[slot]
+        self.notice("Calculating adjustments…")
+        edit = candidate.edit
+        def adjust():
+            cropped = edit.repaired or studio.image_bytes(studio.crop_source(candidate.source, edit, (320, 180)))
+            return studio.auto_adjust(cropped)
+        self.task(adjust, partial(self.auto_ready, slot, candidate, edit))
+
+    def auto_ready(self, slot, candidate, edit, values, error):
+        if error:
+            self.notice(error)
+        else:
+            self.commit()
+            if self.candidates[slot] is not candidate or candidate.edit != edit:
+                return
+            candidate.change(replace(candidate.edit, values=values))
+            if slot == self.active:
+                self.sync_editor()
+            else:
+                self.queue_preview(slot)
+            self.notice(f"Auto Adjust applied to candidate {'ABC'[slot]}")
+
+    def before_toggled(self, enabled):
+        if enabled:
+            self.remove_mode.setCurrentIndex(0)
+        self.queue_preview()
+
+    def toggle_remove(self, mode):
+        if mode != 0 and not offline.ready(self.model_root, "remove"):
+            self.remove_mode.setCurrentIndex(0)
+            slot = self.active
+            candidate = self.candidates[slot]
+            self.prepare_tool("remove", lambda: self.remove_mode.setCurrentIndex(mode)
+                              if self.active == slot and self.candidates[slot] is candidate else None)
             return
-        bar=self.scroll.verticalScrollBar()
-        if bar.maximum() > 0:
-            threshold=min(260,max(100,int(bar.pageStep()*0.22)))
-            if bar.maximum()-value <= threshold:
-                self.next_batch()
+        enabled = mode != 0
+        self.preview.selectable = enabled
+        self.preview.selection_mode = "brush" if mode == 2 else "box"
+        self.brush_width.setVisible(mode == 2)
+        self.remove_actions.setVisible(enabled)
+        self.preview.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        if enabled:
+            self.before.setChecked(False)
+            self.notice("Mark the object or text, then select Apply removal.")
+        else:
+            self.clear_selection()
+
+    def change_brush_width(self, value):
+        self.preview.brush = value / 100
+
+    def enhance(self):
+        slot = self.active
+        candidate = self.candidates[slot]
+        self.prepare_tool("enhance", lambda: self.run_offline_edit(None)
+                          if self.active == slot and self.candidates[slot] is candidate else None)
+
+    def prepare_tool(self, tool, resume):
+        if self.offline_busy:
+            return
+        if offline.ready(self.model_root, tool):
+            resume()
+            return
+        model = offline.MODELS[tool]
+        message = QMessageBox(QMessageBox.Icon.Information, f"Download {model.label}?",
+                              f"Download {model.label} (about {model.megabytes} MB) for offline use?",
+                              parent=self)
+        if not (self.model_root / offline.RUNTIME / ".ready").is_file():
+            message.setInformativeText("The first setup also downloads a shared AI engine for both tools.")
+        accept = message.addButton("Download", QMessageBox.ButtonRole.AcceptRole)
+        cancel = message.addButton(QMessageBox.StandardButton.Cancel)
+        message.setDefaultButton(cancel)
+        message.exec()
+        if message.clickedButton() is not accept:
+            return
+        self.offline_busy = True
+        self.remove_mode.setCurrentIndex(0)
+        self.update_actions()
+        self.notice(f"Setting up {model.label}…")
+
+        def finished(_, error):
+            self.offline_busy = False
+            self.update_actions()
+            self.notice(error or f"{model.label} is ready.")
+            if not error:
+                resume()
+
+        self.task(lambda: offline.install(self.model_root, tool, self.offline_progress.emit, self.offline_stop),
+                  finished)
+
+    def remove_region(self, selection):
+        self.remove_selections.append(selection)
+        self.refresh_selection()
+
+    def undo_selection(self):
+        if self.remove_selections:
+            self.remove_selections.pop()
+            self.refresh_selection()
+
+    def clear_selection(self):
+        self.remove_selections.clear()
+        self.refresh_selection()
+
+    def refresh_selection(self):
+        if self.remove_selections:
+            size = (640, 360)
+            mask = services.combined_mask(size, self.remove_selections)
+            alpha = mask.point(lambda level: level * 120 // 255)
+            overlay = Image.new("RGBA", size, (161, 120, 255))
+            overlay.putalpha(alpha)
+            self.preview.mask_preview = QImage(overlay.tobytes(), *size, size[0] * 4,
+                                               QImage.Format.Format_RGBA8888).copy()
+        else:
+            self.preview.mask_preview = QImage()
+        self.preview.update()
+        self.update_actions()
+
+    def apply_selection(self):
+        if self.remove_selections:
+            self.run_offline_edit(tuple(self.remove_selections))
+
+    def run_offline_edit(self, selection):
+        if self.offline_busy:
+            return
+        self.commit()
+        slot = self.active
+        candidate = self.candidates[slot]
+        if not candidate.source:
+            return
+        edit = candidate.edit
+        self.offline_busy = True
+        if not selection:
+            self.remove_mode.setCurrentIndex(0)
+        self.preview.selectable = False
+        self.update_actions()
+        self.notice("Rebuilding the selected area with LaMa…" if selection else "Enhancing to 1920 × 1080…")
+
+        def process():
+            if edit.repaired:
+                image = studio.open_image(edit.repaired)
+            else:
+                image = studio.crop_source(candidate.source, edit, studio.SIZE)
+            return offline.process(self.model_root, image, selection, self.offline_progress.emit, self.offline_stop)
+
+        self.task(process, partial(self.offline_ready, slot, candidate, edit, bool(selection)))
+
+    def offline_ready(self, slot, candidate, edit, removal, data, error):
+        self.offline_busy = False
+        self.commit()
+        self.preview.selectable = self.remove_mode.currentIndex() != 0
+        if error:
+            self.notice(error)
+        elif self.candidates[slot] is candidate and (candidate.edit.crop, candidate.edit.vertical, candidate.edit.zoom,
+               candidate.edit.repaired) == (edit.crop, edit.vertical, edit.zoom, edit.repaired):
+            candidate.change(replace(candidate.edit, repaired=data, enhanced=edit.enhanced or not removal))
+            if slot == self.active:
+                if removal:
+                    self.clear_selection()
+                self.sync_editor()
+            else:
+                self.queue_preview(slot)
+            self.notice("Selection rebuilt." if removal else "Enhanced to 1920 × 1080.")
+        else:
+            self.notice("The candidate changed while the AI job was running. Run the tool again.")
+
+    def download_candidate(self):
+        self.commit()
+        candidate = self.candidates[self.active]
+        if self.downloading or not candidate.source:
+            return
+        letter = "ABC"[self.active]
+        folder = self.settings.value("exports", "", type=str)
+        suggested = str(Path(folder) / f"Candidate {letter}.jpg")
+        dialog = QFileDialog(self, "Download edited thumbnail", suggested, "JPEG image (*.jpg *.jpeg)")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setDefaultSuffix("jpg")
+        if not dialog.exec():
+            return
+        path = Path(dialog.selectedFiles()[0])
+        snapshot = studio.Candidate(candidate.source, candidate.filename, candidate.edit)
+        self.settings.setValue("exports", str(path.parent))
+        self.downloading = True
+        self.update_actions()
+        self.notice(f"Saving candidate {letter}…")
+
+        def finished(size, error):
+            self.downloading = False
+            self.update_actions()
+            self.notice(error or f"Saved {path.name} · {size[0]} × {size[1]}")
+
+        self.task(lambda: studio.download(snapshot, path), finished)
+
+    def set_small(self, enabled):
+        self.preview.setMaximumSize(240, 135) if enabled else self.preview.setMaximumSize(16777215, 16777215)
+        self.preview.setMinimumHeight(100 if enabled else 220)
+
+    def queue_preview(self, slot=None):
+        slot = self.active if slot is None else slot
+        self.preview_revision[slot] += 1
+        if self.candidates[slot].source:
+            self.preview_dirty.add(slot)
+            if not self.preview_busy:
+                self.preview_timer.start()
+
+    def update_previews(self):
+        if not self.preview_dirty:
+            return
+        active = self.active
+        slot = active if active in self.preview_dirty else min(self.preview_dirty)
+        self.preview_dirty.remove(slot)
+        candidate = self.candidates[slot]
+        edit = self.draft if slot == active else candidate.edit
+        before = slot == active and self.before.isChecked()
+        revision = self.preview_revision[slot]
+        self.preview_busy = True
+
+        def render():
+            picture = studio.render(candidate.source, edit, (640, 360))
+            edited = self.preview_image(picture)
+            original = self.preview_image(studio.render(candidate.source, edit, (640, 360),
+                                                        original=True)) if before else edited
+            return edited, original
+
+        self.task(render, partial(self.preview_ready, slot, revision))
 
     @staticmethod
-    def safe_name(value):
-        return "".join(c for c in value if c.isalnum() or c in " -_").strip().replace(" ","_")[:80]
+    def preview_image(image):
+        return QImage(image.tobytes(), image.width, image.height, image.width * 3,
+                      QImage.Format.Format_RGB888).copy()
 
+    def preview_ready(self, slot, revision, pictures, error):
+        self.preview_busy = False
+        if revision == self.preview_revision[slot]:
+            if error:
+                self.notice(error)
+            else:
+                edited, current = pictures
+                self.slot_images[slot].set_data(edited)
+                if slot == self.active:
+                    self.preview.set_data(current)
+        if self.preview_dirty:
+            self.preview_timer.start(0)
 
-def main():
-    log_path = configure_logging()
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setApplicationVersion(APP_VERSION)
-    sys.excepthook = handle_unhandled_exception
+    def export_candidates(self):
+        self.commit()
+        folder = QFileDialog.getExistingDirectory(self, "Choose export folder", self.settings.value("exports", ""))
+        if folder:
+            self.settings.setValue("exports", folder)
+            snapshot = [studio.Candidate(candidate.source, candidate.filename, candidate.edit) for candidate in self.candidates]
+            movie = self.movie.text()
+            self.exporting = True
+            self.export_button.setEnabled(False)
+            self.notice("Exporting three JPGs…")
+            self.task(lambda: studio.export(snapshot, folder, movie), self.export_ready)
 
-    # Check the remote live switch and minimum supported version before creating
-    # the main window. A network failure is fail-open inside release_control.py.
-    release_state = evaluate_release(fetch_release_control(), APP_VERSION)
-    if not release_state["allowed"]:
-        message = release_state["message"] or (
-            "Thumb Finder is temporarily unavailable." if not release_state["enabled"]
-            else f"Please update Thumb Finder to version {release_state['minimum_version']} or newer."
-        )
-        QMessageBox.warning(None, "Thumb Finder unavailable", message)
-        if release_state["enabled"]:
-            QDesktopServices.openUrl(QUrl(release_state["release_url"]))
-        return 0
-    if release_state["update_available"]:
-        latest = release_state["latest_version"]
-        message = release_state["message"] or f"Thumb Finder {latest} is available."
-        answer = QMessageBox.question(
-            None, "Update available",
-            f"{message}\n\nInstalled version: {APP_VERSION}\nLatest version: {latest}\n\nOpen the download page?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-        )
-        if answer == QMessageBox.Yes:
-            QDesktopServices.openUrl(QUrl(release_state["release_url"]))
+    def export_ready(self, path, error):
+        self.exporting = False
+        self.update_actions()
+        if error:
+            self.notice(error)
+        else:
+            self.notice(f"Exported A, B and C · {path}")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
-    def thread_exception_hook(args):
-        logging.critical("Unhandled background-thread exception",
-                         exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
-    if hasattr(threading, "excepthook"):
-        threading.excepthook = thread_exception_hook
+    def open_settings(self):
+        dialog = QDialog(self, windowTitle="Settings")
+        dialog.setMinimumWidth(425)
+        form = QFormLayout(dialog)
+        keys = []
+        for index in (1, 2):
+            field = QLineEdit(self.settings.value(f"youtube/key{index}", ""))
+            field.setEchoMode(QLineEdit.EchoMode.Password)
+            field.setPlaceholderText("Uses the environment or build default if blank")
+            form.addRow(f"YouTube API key {index}", field)
+            keys.append(field)
+        appearance = QComboBox()
+        appearance.addItems(["System", "Light", "Dark"])
+        appearance.setCurrentIndex((2 if self.dark else 1) if self.settings.contains("dark") else 0)
+        form.addRow("Appearance", appearance)
+        server = QLineEdit(self.settings.value("create/server", comfy.DEFAULT_SERVER, type=str))
+        server.setPlaceholderText(comfy.DEFAULT_SERVER)
+        form.addRow("ComfyUI server", server)
+        account = QLineEdit(self.settings.value("create/account", "", type=str))
+        token = QLineEdit(self.settings.value("create/token", "", type=str))
+        token.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Cloudflare account ID", account)
+        form.addRow("Workers AI token", token)
+        actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        def save():
+            try:
+                comfy.server_url(server.text() or comfy.DEFAULT_SERVER)
+            except ValueError as error:
+                QMessageBox.warning(dialog, "ComfyUI server", str(error))
+            else:
+                dialog.accept()
 
-    resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-    icon_path = resource_root / ("app_icon.ico" if sys.platform == "win32" else "app_icon.icns")
-    if not icon_path.exists():
-        icon_path = Path(__file__).parent / "app_icon.svg"
-    if icon_path.exists():
-        app.setWindowIcon(QIcon(str(icon_path)))
+        actions.accepted.connect(save)
+        actions.rejected.connect(dialog.reject)
+        form.addRow(actions)
+        if dialog.exec():
+            self.settings.setValue("create/server", comfy.server_url(server.text() or comfy.DEFAULT_SERVER))
+            self.settings.setValue("create/account", account.text().strip())
+            self.settings.setValue("create/token", token.text().strip())
+            for index, field in enumerate(keys, 1):
+                self.settings.setValue(f"youtube/key{index}", field.text().strip())
+            new = self.make_youtube()
+            if new.keys != self.youtube.keys:
+                self.youtube = new
+            if appearance.currentIndex():
+                self.dark = appearance.currentIndex() == 2
+                self.settings.setValue("dark", self.dark)
+            else:
+                self.settings.remove("dark")
+                self.dark = QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
+            self.theme.animate(self.dark)
+            self.apply_theme()
+            self.notice("Settings saved")
 
-    try:
-        window = MainWindow()
-        if not window.run_first_launch_setup():
-            return 1
-        window.show()
-        logging.info("Thumb Finder %s started in local-debug mode", APP_VERSION)
-        # Delay the first-run prompt until Qt has painted the main window.
-        if not window.api_key:
-            QTimer.singleShot(120, window.prompt_for_api_key)
-        return app.exec()
-    except Exception as exc:
-        logging.exception("Fatal startup error")
-        QMessageBox.critical(
-            None,
-            "Thumb Finder could not start",
-            f"The application encountered a startup error.\n\n{exc}\n\n"
-            f"Diagnostic log: {log_path or 'Unavailable'}",
-        )
-        return 1
+    def check_updates(self):
+        self.notice("Checking for updates…")
 
-if __name__ == "__main__":
-    main()
+        def check():
+            url = REPOSITORY.replace("github.com", "api.github.com/repos") + "/releases/latest"
+            response = requests.get(url, timeout=(4, 8))
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            return response.json().get("tag_name", "").lstrip("v")
+
+        self.task(check, self.updates_ready)
+
+    def updates_ready(self, version, error):
+        if error:
+            text = "The update check could not reach GitHub."
+        elif not version:
+            text = "GitHub did not return a published release."
+        else:
+            def parts(value):
+                import re
+                numbers = tuple(map(int, re.findall(r"\d+", value.split("-")[0])[:3]))
+                return (numbers + (0, 0, 0))[:3]
+            text = f"Thumb Finder {version} is available." if parts(version) > parts(VERSION) else f"You are using Thumb Finder v{VERSION}."
+        self.notice(text)
+        message = QMessageBox(QMessageBox.Icon.Information, "Check for updates", text, parent=self)
+        releases = message.addButton("Open GitHub Releases", QMessageBox.ButtonRole.ActionRole)
+        message.addButton(QMessageBox.StandardButton.Close)
+        message.exec()
+        if message.clickedButton() is releases:
+            QDesktopServices.openUrl(QUrl(REPOSITORY + "/releases"))
+
+    def closeEvent(self, event):
+        self.create_stop.set()
+        self.offline_stop.set()
+        self.search_generation += 1
+        self.preview_timer.stop()
+        for pool in (self.image_pool, self.search_pool, self.pool):
+            pool.clear()
+        super().closeEvent(event)

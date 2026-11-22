@@ -1,144 +1,102 @@
-name: Build and publish Thumb Finder
+name: Build Thumb Finder for Apple Silicon
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
+  push:
+    tags: ['v1.0']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  test:
-    name: Validate source
-    runs-on: ubuntu-latest
-    env:
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
+  macos-arm64:
+    runs-on: macos-15
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v5
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - name: Install test dependencies
+          python-version: '3.12'
+          architecture: arm64
+      - name: Install and test
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pytest
-      - name: Run tests with full diagnostics
-        run: python -X utf8 -m pytest -vv --tb=long
-
-  build:
-    name: Build ${{ matrix.name }}
-    needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows x64
-            os: windows-latest
-            artifact: windows-x64
-          - name: macOS Intel
-            os: macos-15-intel
-            artifact: macos-intel-x64
-          - name: macOS Apple Silicon
-            os: macos-15
-            artifact: macos-apple-silicon-arm64
-
-    runs-on: ${{ matrix.os }}
-    env:
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v5
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-      - name: Set version from release tag
-        shell: bash
+          test "$(uname -m)" = arm64
+          python -m pip install -r requirements.txt "pyinstaller>=6,<7"
+          python -m compileall -q run_app.py thumb_finder tests
+          python -m unittest discover -s tests
+      - name: Provide optional build defaults
+        env:
+          YOUTUBE_API_KEY_1: ${{ secrets.YOUTUBE_API_KEY_1 }}
+          YOUTUBE_API_KEY_2: ${{ secrets.YOUTUBE_API_KEY_2 }}
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          python - "$TAG_VERSION" <<'PY'
-          import pathlib, re, sys
-          tag_version = sys.argv[1]
-          if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", tag_version):
-              raise SystemExit(f"Invalid release tag version: {tag_version}. Use v1.0 or v1.0.1.")
-          # Accept tags such as v1.0; Python packaging uses normalized 1.0.0.
-          version = tag_version if tag_version.count(".") == 2 else tag_version + ".0"
-          pathlib.Path("thumb_finder/version.py").write_text(
-              '"""Single source of truth for the application version."""\n'
-              f'__version__ = "{version}"\n', encoding="utf-8"
-          )
-          pyproject = pathlib.Path("pyproject.toml")
-          text = pyproject.read_text(encoding="utf-8")
-          text = re.sub(r'(?m)^version = "[^"]+"$', f'version = "{version}"', text, count=1)
-          pyproject.write_text(text, encoding="utf-8")
+          python - <<'PY'
+          from pathlib import Path
+          import os
+
+          keys = tuple(os.environ.get(f"YOUTUBE_API_KEY_{i}", "") for i in (1, 2))
+          Path("thumb_finder/_build_keys.py").write_text(f"KEYS = {keys!r}\n")
           PY
-      - name: Install build dependencies
+      - name: Package
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
-      - name: Build Windows app
-        if: runner.os == 'Windows'
-        shell: pwsh
+          mkdir -p build/AppIcon.iconset
+          python - <<'PY'
+          from PySide6.QtCore import Qt
+          from PySide6.QtGui import QGuiApplication, QImage, QPainter
+          from PySide6.QtSvg import QSvgRenderer
+
+          app = QGuiApplication([])
+          renderer = QSvgRenderer("thumb_finder/app_icon.svg")
+          assert renderer.isValid(), "The source app icon could not be loaded."
+          for size in (16, 32, 128, 256, 512):
+              for scale in (1, 2):
+                  pixels = size * scale
+                  image = QImage(pixels, pixels, QImage.Format.Format_ARGB32)
+                  image.fill(Qt.GlobalColor.transparent)
+                  painter = QPainter(image)
+                  renderer.render(painter)
+                  painter.end()
+                  suffix = "@2x" if scale == 2 else ""
+                  assert image.save(f"build/AppIcon.iconset/icon_{size}x{size}{suffix}.png")
+          PY
+          iconutil -c icns build/AppIcon.iconset -o build/AppIcon.icns
+          python -m PyInstaller --noconfirm --windowed --name "Thumb Finder" --icon build/AppIcon.icns --add-data "thumb_finder/app_icon.svg:thumb_finder" --add-data "thumb_finder/chevron.svg:thumb_finder" --add-data "thumb_finder/offline_worker.py:thumb_finder" --target-arch arm64 --osx-bundle-identifier com.thumbfinder.app run_app.py
+          ditto -c -k --keepParent "dist/Thumb Finder.app" "dist/Thumb-Finder-v1.0-macOS-arm64.zip"
+          unzip -t "dist/Thumb-Finder-v1.0-macOS-arm64.zip"
+      - name: Verify signature, icon, and launch from the release ZIP
         run: |
-          pyinstaller --noconfirm --clean --windowed --name ThumbFinder `
-            --icon "thumb_finder/app_icon.ico" `
-            --collect-all PySide6 --collect-all cv2 `
-            --add-data "thumb_finder/app_icon.ico;." `
-            --add-data "thumb_finder/app_icon.svg;." `
-            --add-data "thumb_finder/logo.svg;thumb_finder" `
-            run_app.py
-          if (!(Test-Path "dist/ThumbFinder/ThumbFinder.exe")) { throw "PyInstaller did not create ThumbFinder.exe" }
-          Compress-Archive -Path dist/ThumbFinder -DestinationPath "ThumbFinder-${{ github.ref_name }}-${{ matrix.artifact }}.zip"
-      - name: Prepare macOS icon
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p build/ThumbFinder.iconset
-          for size in 16 32 128 256 512; do
-            sips -z "$size" "$size" thumb_finder/app_icon.png --out "build/ThumbFinder.iconset/icon_${size}x${size}.png" >/dev/null
-            double=$((size * 2))
-            sips -z "$double" "$double" thumb_finder/app_icon.png --out "build/ThumbFinder.iconset/icon_${size}x${size}@2x.png" >/dev/null
-          done
-          iconutil -c icns build/ThumbFinder.iconset -o thumb_finder/app_icon.icns
-          test -s thumb_finder/app_icon.icns
-      - name: Build macOS app
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ARCH="$(uname -m)"
-          echo "Runner architecture: ${ARCH}"
-          pyinstaller --noconfirm --clean --windowed --name ThumbFinder \
-            --target-architecture "${ARCH}" \
-            --osx-bundle-identifier "com.hemantHQ.thumbfinder" \
-            --icon "thumb_finder/app_icon.icns" \
-            --collect-all PySide6 --collect-all cv2 \
-            --add-data "thumb_finder/app_icon.icns:." \
-            --add-data "thumb_finder/app_icon.svg:." \
-            --add-data "thumb_finder/logo.svg:thumb_finder" \
-            run_app.py
-          test -d dist/ThumbFinder.app
-          test -f dist/ThumbFinder.app/Contents/Info.plist
-          ditto -c -k --sequesterRsrc --keepParent dist/ThumbFinder.app "ThumbFinder-${GITHUB_REF_NAME}-${{ matrix.artifact }}.zip"
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+          verify_dir="$(mktemp -d)"
+          ditto -x -k "dist/Thumb-Finder-v1.0-macOS-arm64.zip" "$verify_dir"
+          bundle="$verify_dir/Thumb Finder.app"
+          executable="$bundle/Contents/MacOS/Thumb Finder"
+          lipo -verify_arch arm64 "$executable"
+          codesign --verify --deep --strict --verbose=2 "$bundle"
+          python - "$bundle" "$executable" "$verify_dir" <<'PY'
+          from pathlib import Path
+          import os
+          import plistlib
+          import subprocess
+          import sys
+
+          bundle, executable, verify_dir = map(Path, sys.argv[1:])
+          contents = bundle / "Contents"
+          with (contents / "Info.plist").open("rb") as file:
+              info = plistlib.load(file)
+          assert info["CFBundleIdentifier"] == "com.thumbfinder.app"
+          icon = contents / "Resources" / info["CFBundleIconFile"]
+          if not icon.suffix:
+              icon = icon.with_suffix(".icns")
+          assert icon.read_bytes().startswith(b"icns"), "The Finder icon is missing or invalid."
+          marker = verify_dir / "launch-ok"
+          env = os.environ.copy()
+          env["QT_QPA_PLATFORM"] = "cocoa"
+          subprocess.run([str(executable), "--smoke-test", str(marker)],
+                         env=env, timeout=40, check=True)
+          assert marker.read_text(encoding="utf-8") == "cocoa", "The native Qt window failed to launch."
+          PY
+      - uses: actions/upload-artifact@v4
         with:
-          name: ThumbFinder-${{ github.ref_name }}-${{ matrix.artifact }}
-          path: ThumbFinder-${{ github.ref_name }}-${{ matrix.artifact }}.zip
-          if-no-files-found: error
-          retention-days: 14
-      - name: Attach build to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ThumbFinder-${{ github.ref_name }}-${{ matrix.artifact }}.zip
-          generate_release_notes: true
+          name: Thumb-Finder-v1.0-macOS-arm64
+          path: dist/Thumb-Finder-v1.0-macOS-arm64.zip
