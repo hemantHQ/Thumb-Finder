@@ -71,7 +71,7 @@ jobs:
           ditto -x -k "dist/Thumb-Finder-v1.0-macOS-arm64.zip" "$verify_dir"
           bundle="$verify_dir/Thumb Finder.app"
           executable="$bundle/Contents/MacOS/Thumb Finder"
-          lipo -verify_arch arm64 "$executable"
+          lipo "$executable" -verify_arch arm64
           codesign --verify --deep --strict --verbose=2 "$bundle"
           python - "$bundle" "$executable" "$verify_dir" <<'PY'
           from pathlib import Path
