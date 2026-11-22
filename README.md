@@ -62,14 +62,14 @@ One arm64 build targets both Mac mini M4 and M6. The workflow builds on a macOS 
 
 1. In GitHub Desktop, open your existing local `hemantHQ/Thumb-Finder` repository or use **File → Clone repository**. Copy the contents of the extracted source folder into the clone, including `.github`.
 2. Review **Changes**, commit to the intended branch, and click **Push origin**. If you are working on a separate branch, merge it into the default branch before running the workflow from the Actions page.
-3. In the browser, go to **Actions → Build Thumb Finder for Apple Silicon → Run workflow**. Open the successful run and download the artifact. Extract its outer archive and keep the inner `Thumb-Finder-v1.0-macOS-arm64.zip`.
-4. Install and test the exact inner ZIP on each Mac you list as tested. Once verified, attach it to a GitHub release. The workflow can also run when a new `v1.0` tag is pushed.
+3. In the browser, go to **Actions → Build Thumb Finder for Apple Silicon → Run workflow**. Select the default branch and keep **Publish the verified ZIP to Releases from the default branch** checked. After both jobs pass, download `Thumb-Finder-v1.0-macOS-arm64.zip` from **Releases → Assets**. A push of the `v1.0` tag also publishes after verification.
+4. Uncheck the publish option for an artifact-only test build. You can download the ZIP from the successful run under **Artifacts**. Test the exact ZIP on each Mac you list as tested. The automatic publish job preserves an existing release asset and checks that the tag points to the verified commit.
 
 ### Install on a Mac
 
 Extract the ZIP, drag **Thumb Finder.app** into **Applications**, and open it there. Ad-hoc signing allows the native Apple Silicon code to load. Apple Gatekeeper can still show a first-launch warning for an unnotarized download. If you trust and have verified this build, try opening it once and use **System Settings → Privacy & Security → Open Anyway** if Apple offers it. If the app actually launches and then quits unexpectedly, save the macOS crash report so the startup failure can be diagnosed. [Apple's app-opening guidance](https://support.apple.com/en-us/102445)
 
-Build-time API keys are optional and can be recovered from a distributed bundle. Use local keys for distribution to other users. GitHub's update check opens Releases for manual installation.
+Only manual artifact-only builds can embed the optional YouTube secrets. These values can be recovered from the resulting bundle. Release builds use credentials entered in the app's Settings. GitHub's update check opens Releases for manual installation.
 
 ## Checks
 
