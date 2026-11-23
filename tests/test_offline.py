@@ -10,6 +10,16 @@ from thumb_finder import offline, offline_worker, services
 
 
 class OfflineSetupTests(TestCase):
+    def test_enhancement_finishes_at_fhd_without_tinting_neutrals(self):
+        original = Image.new("RGB", (32, 18), (80, 80, 80))
+        original.paste((140, 140, 140), (16, 0, 32, 18))
+        enhanced = offline_worker.finish_enhancement(original.resize((64, 36)), original)
+        self.assertEqual(enhanced.size, (1920, 1080))
+        for point in ((150, 500), (1750, 500)):
+            red, green, blue = enhanced.getpixel(point)
+            self.assertEqual(red, green)
+            self.assertEqual(green, blue)
+
     def test_repair_maps_separate_marks_and_preserves_surroundings(self):
         image = Image.new("RGB", (400, 225), "red")
         selections = (
@@ -53,6 +63,9 @@ class OfflineSetupTests(TestCase):
                 self.assertEqual(transfer.call_count, 2)
                 self.assertEqual(command.call_count, 2)
                 self.assertEqual(list(root.glob("setup-*")), [])
+                offline.delete_model(root, "remove")
+                self.assertFalse(offline.ready(root, "remove"))
+                self.assertTrue(offline.ready(root, "enhance"))
 
     @patch("thumb_finder.offline.requests.get")
     def test_download_rejects_wrong_digest(self, get):

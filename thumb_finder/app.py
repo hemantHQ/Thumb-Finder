@@ -4,6 +4,8 @@ from functools import partial
 from pathlib import Path
 from threading import Event
 import os
+import re
+import shutil
 
 import requests
 from PIL import Image, ImageOps
@@ -14,15 +16,15 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QGraphicsOpacityEffect,
                                QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-                               QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+                               QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
                                QStackedWidget, QVBoxLayout, QWidget)
 
-from . import VERSION
-from . import comfy, offline, services, studio
-from .youtube import REPOSITORY, YouTube, distance, signature, thumbnail, video_id
+from . import BUILD, VERSION
+from . import comfy, offline, services, studio, updater
+from .youtube import (Channel, LANGUAGES, REGIONS, REPOSITORY, YouTube, distance, signature,
+                      thumbnail, translate_query, video_id)
 
 PATHS = {
-    "logo": '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3z"/>',
     "search": '<circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/>',
     "create": '<path d="M12 2l2.5 7.5L22 12l-7.5 2.5L12 22l-2.5-7.5L2 12l7.5-2.5z"/>',
     "edit": '<path d="m4 16-1 5 5-1L20 8l-4-4zM13 7l4 4"/>',
@@ -79,6 +81,15 @@ def row(*widgets):
     return layout
 
 
+def busy_bar():
+    bar = QProgressBar()
+    bar.setTextVisible(False)
+    bar.setFixedHeight(5)
+    bar.setRange(0, 0)
+    bar.hide()
+    return bar
+
+
 class TaskSignals(QObject):
     done = Signal(object, object)
 
@@ -114,6 +125,40 @@ class Picture(QWidget):
         self.canvas_color = QColor("#ebe8f3")
         self.text_color = QColor("#625d78")
         self.start = self.end = None
+        self.loading = panel("surface")
+        self.loading.setParent(self)
+        self.loading.setMinimumWidth(220)
+        self.loading.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        progress = QVBoxLayout(self.loading)
+        progress.setContentsMargins(16, 12, 16, 12)
+        self.loading_title = label("", "strong")
+        self.loading_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        progress.addWidget(self.loading_title)
+        self.loading_bar = busy_bar()
+        progress.addWidget(self.loading_bar)
+        self.loading.hide()
+
+    def show_loading(self, title, percent=None):
+        if not title:
+            self.loading.hide()
+            return
+        self.loading_title.setText(title)
+        self.loading_bar.setRange(0, 0 if percent is None else 100)
+        if percent is not None:
+            self.loading_bar.setValue(percent)
+        self.loading_bar.show()
+        self.loading.adjustSize()
+        self.position_loading()
+        self.loading.show()
+        self.loading.raise_()
+
+    def position_loading(self):
+        self.loading.move((self.width() - self.loading.width()) // 2,
+                          (self.height() - self.loading.height()) // 2)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.position_loading()
 
     def set_data(self, data, placeholder=None):
         self.pixmap = QPixmap.fromImage(data) if isinstance(data, QImage) else QPixmap()
@@ -242,6 +287,7 @@ class Window(QMainWindow):
         self.create_paths = ["", ""]
         self.create_outputs = []
         self.offline_busy = False
+        self.auto_busy = False
         self.downloading = False
         self.remove_selections = []
         self.offline_stop = Event()
@@ -311,9 +357,9 @@ class Window(QMainWindow):
         header.addStretch()
         self.theme = ThemeSwitch(self.dark, self.toggle_theme)
         header.addWidget(self.theme)
-        update = button("Updates", self.check_updates, "", "update")
-        update.setToolTip("Check for updates")
-        header.addWidget(update)
+        self.update_button = button("Updates", self.check_updates, "", "update")
+        self.update_button.setToolTip("Check for updates")
+        header.addWidget(self.update_button)
         header.addWidget(button("Settings", self.open_settings, "", "settings"))
         layout.addLayout(header)
 
@@ -330,7 +376,7 @@ class Window(QMainWindow):
         footer.addWidget(label("Thumb Finder by Hemant", "credit"))
         layout.addLayout(footer)
         self.setCentralWidget(body)
-        self.offline_progress.connect(self.notice, Qt.ConnectionType.QueuedConnection)
+        self.offline_progress.connect(self.show_edit_progress, Qt.ConnectionType.QueuedConnection)
         self.draft_ready.connect(self.show_generation_progress, Qt.ConnectionType.QueuedConnection)
         self.apply_theme()
         self.show_page(0)
@@ -427,6 +473,8 @@ class Window(QMainWindow):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{height: 0;}}
             QSlider::groove:horizontal {{height: 4px; background: {border}; border-radius: 2px;}}
             QSlider::handle:horizontal {{background: {accent}; width: 13px; margin: -5px 0; border-radius: 6px;}}
+            QProgressBar {{background: {border}; border: 0; border-radius: 2px;}}
+            QProgressBar::chunk {{background: {accent}; border-radius: 2px;}}
             QToolTip, QDialog, QMessageBox {{background: {surface}; color: {ink};}}
         """)
         for widget in self.findChildren(QPushButton):
@@ -459,17 +507,46 @@ class Window(QMainWindow):
         self.query.clearButtonEnabled = True
         self.query.returnPressed.connect(self.start_search)
         self.search_button = button("Search", self.start_search, "primary", "search")
-        search = row(self.query, self.search_button)
-        search.setStretch(0, 1)
-        contents.addLayout(search)
         self.genre = QComboBox()
         self.genre.addItems(["Category", "Action", "Comedy", "Drama", "Horror", "Romance", "Thriller", "Western"])
         self.genre.setAccessibleName("Category")
         self.genre.setMinimumWidth(135)
+        self.search_market = QComboBox()
+        for name, code in REGIONS:
+            self.search_market.addItem(name, code)
+        self.search_market.setAccessibleName("Search region")
+        self.search_market.setToolTip("Filters YouTube results by country availability.")
+        self.search_language = QComboBox()
+        self.search_source = QComboBox()
+        self.search_language.setAccessibleName("Result language")
+        self.search_source.setAccessibleName("Translate search query from")
+        self.search_source.addItem("As typed", "")
+        for name, code in LANGUAGES:
+            self.search_language.addItem(name, code)
+            self.search_source.addItem(f"From {name}", code)
+        self.search_source.setToolTip("Translates the query into the result language using MyMemory.")
+        self.search_mode = QComboBox()
+        self.search_mode.addItems(["Videos", "Channels"])
+        self.search_mode.setAccessibleName("Result type")
+        old_argentina = self.settings.value("search/market", 0, type=int) == 1
+        prior_source = self.settings.value("search/language", 1, type=int)
+        self.search_mode.setCurrentIndex(min(1, max(0, self.settings.value("search/mode", int(old_argentina), type=int))))
+        self.search_mode.currentIndexChanged.connect(lambda index: self.settings.setValue("search/mode", index))
+        for field, key, fallback in (
+            (self.search_market, "region", "AR" if old_argentina else ""),
+            (self.search_language, "target", "pt-BR" if old_argentina else "en"),
+            (self.search_source, "source", ("", "en", "es")[min(2, max(0, prior_source))] if old_argentina else ""),
+        ):
+            field.setCurrentIndex(max(0, field.findData(self.settings.value(f"search/{key}", fallback, type=str))))
+            field.currentIndexChanged.connect(lambda _, widget=field, setting=key:
+                                              self.settings.setValue(f"search/{setting}", widget.currentData()))
         self.reference_button = button("Reference image", self.pick_reference, "", "image")
         self.clear_reference = button("Clear", self.remove_reference)
         self.clear_reference.hide()
-        filters = row(self.genre, self.reference_button, self.clear_reference)
+        search = row(self.query, self.reference_button, self.clear_reference, self.search_button)
+        search.setStretch(0, 1)
+        contents.addLayout(search)
+        filters = row(self.genre, self.search_market, self.search_language, self.search_source, self.search_mode)
         filters.addStretch()
         contents.addLayout(filters)
         layout.addWidget(hero)
@@ -480,7 +557,12 @@ class Window(QMainWindow):
         heading = row(self.results_label)
         heading.addStretch()
         heading.addWidget(self.sort_label)
+        self.back_to_channels = button("Back to channels", self.start_search)
+        self.back_to_channels.hide()
+        heading.addWidget(self.back_to_channels)
         layout.addLayout(heading)
+        self.search_loading = busy_bar()
+        layout.addWidget(self.search_loading)
         self.result_scroll = QScrollArea()
         self.result_scroll.setWidgetResizable(True)
         self.result_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -513,21 +595,21 @@ class Window(QMainWindow):
         title = row(label("Create a thumbnail", "heading"))
         title.addStretch()
         self.create_provider = QComboBox()
-        self.create_provider.addItems(["Cloudflare · Online", "ComfyUI · Local"])
+        self.create_provider.addItem("Online · 4B Draft", "4b")
+        self.create_provider.addItem("Online · 9B Detail", "9b")
+        self.create_provider.addItem("Local · ComfyUI", "local")
         self.create_provider.currentIndexChanged.connect(self.update_create_provider)
         title.addWidget(self.create_provider)
         title.addWidget(button("Model setup", self.open_model_setup))
         form.addLayout(title)
         self.create_prompt = QPlainTextEdit()
-        self.create_prompt.setPlaceholderText(
-            "Describe the scene, lighting, and expression you want. Mention what to keep from your references.")
         self.create_prompt.setFixedHeight(94)
         form.addWidget(self.create_prompt)
 
         references = QHBoxLayout()
         self.create_reference_buttons = []
         self.create_clear_buttons = []
-        for index, role in enumerate(("Composition reference", "Cast reference")):
+        for index, role in enumerate(("Attach image", "Add reference")):
             pick = button(role, partial(self.pick_create_reference, index), "", "image")
             clear = button("Clear", partial(self.set_create_reference, index, ""))
             clear.hide()
@@ -550,6 +632,8 @@ class Window(QMainWindow):
         status_line = row(self.create_status, self.stop_generation)
         status_line.setStretch(0, 1)
         layout.addLayout(status_line)
+        self.create_loading = busy_bar()
+        layout.addWidget(self.create_loading)
         self.create_history = QComboBox()
         self.create_history.setAccessibleName("Draft history")
         self.create_history.currentIndexChanged.connect(self.open_draft_batch)
@@ -586,18 +670,23 @@ class Window(QMainWindow):
         return page
 
     def update_create_provider(self):
-        local = self.create_provider.currentIndex() == 1
+        model = self.create_provider.currentData()
+        local = model == "local"
         for index, widget in enumerate(self.create_reference_buttons):
-            widget.setVisible(local)
-            self.create_clear_buttons[index].setVisible(local and bool(self.create_paths[index]))
+            widget.setToolTip(self.create_paths[index] or
+                              ("Reference stays on your ComfyUI server." if local else
+                               "This attachment is sent to Cloudflare when you generate."))
+            self.create_clear_buttons[index].setVisible(bool(self.create_paths[index]))
         self.create_prompt.setPlaceholderText(
-            "Describe the scene, lighting, and expression. Say what to keep from your references." if local
-            else "Describe a movie scene, the main subject, and the mood.")
-        self.create_status.setText("Start ComfyUI to generate with optional reference images." if local else
-                                   "Online text-to-image. Connect Cloudflare Workers AI in Settings.")
+            "Describe a new scene or attach an image and say what to change and what to keep.")
+        self.create_status.setText({
+            "local": "Start ComfyUI to generate locally.",
+            "4b": "512 × 288 drafts · uses less free quota",
+            "9b": "1024 × 576 drafts · uses substantially more quota",
+        }[model])
 
     def open_model_setup(self):
-        url = comfy.SETUP_URL if self.create_provider.currentIndex() else (
+        url = comfy.SETUP_URL if self.create_provider.currentData() == "local" else (
             "https://developers.cloudflare.com/workers-ai/get-started/rest-api/")
         QDesktopServices.openUrl(QUrl(url))
 
@@ -609,11 +698,12 @@ class Window(QMainWindow):
 
     def set_create_reference(self, index, path):
         self.create_paths[index] = path
-        role = ("Composition reference", "Cast reference")[index]
+        role = ("Attach image", "Add reference")[index]
         pick = self.create_reference_buttons[index]
-        pick.setText(f"{role.split()[0]} · {Path(path).name[:20]}" if path else role)
-        pick.setToolTip(path or role)
-        self.create_clear_buttons[index].setVisible(bool(path) and self.create_provider.currentIndex() == 1)
+        pick.setText(Path(path).name[:20] if path else role)
+        pick.setToolTip(path or ("Sent to Cloudflare when you generate." if self.create_provider.currentData() != "local" else
+                                "Reference stays on your ComfyUI server."))
+        self.create_clear_buttons[index].setVisible(bool(path))
 
     def generate_images(self):
         if not self.generate_button.isEnabled():
@@ -624,10 +714,11 @@ class Window(QMainWindow):
             self.create_prompt.setFocus()
             return
         server = self.settings.value("create/server", comfy.DEFAULT_SERVER, type=str)
-        online = self.create_provider.currentIndex() == 0
+        model = self.create_provider.currentData()
+        online = model != "local"
         account = self.settings.value("create/account", "", type=str)
         token = os.environ.get("CLOUDFLARE_API_TOKEN") or self.settings.value("create/token", "", type=str)
-        references = tuple(zip(("composition reference", "cast reference"), self.create_paths))
+        references = tuple(zip(("source image to edit", "visual reference"), self.create_paths))
         count = (1, 3)[self.create_count.currentIndex()]
         self.stop_batch.clear()
         self.generate_button.setEnabled(False)
@@ -637,6 +728,7 @@ class Window(QMainWindow):
         self.stop_generation.setVisible(count > 1)
         self.stop_generation.setEnabled(True)
         self.create_status.setText(f"Generating draft 1 of {count}…")
+        self.create_loading.show()
         history_root = self.history_root
 
         def generate():
@@ -648,7 +740,10 @@ class Window(QMainWindow):
                 with requests.Session() as session:
                     session.trust_env = False
                     if online:
-                        images = (services.cloud_image(account, token, f"{prompt} Cinematic YouTube movie thumbnail. {concept}")
+                        attached = services.cloud_references(references)
+                        images = (services.cloud_image(account, token,
+                                                       f"{prompt} Cinematic YouTube movie thumbnail. {concept}",
+                                                       attached, model=model)
                                   for concept in (comfy.CONCEPTS if count == 3 else ("",))
                                   if not self.create_stop.is_set())
                     else:
@@ -675,6 +770,7 @@ class Window(QMainWindow):
         self.create_provider.setEnabled(True)
         self.create_history.setEnabled(True)
         self.stop_generation.hide()
+        self.create_loading.hide()
         generated, problem, folder = result if result else ([], error, None)
         if generated:
             self.refresh_draft_history(folder)
@@ -769,9 +865,20 @@ class Window(QMainWindow):
         if not self.youtube.keys:
             self.notice("Add a YouTube Data API key in Settings to search.")
             return
-        if not query and self.reference is None:
+        genre = self.genre.currentText() if self.genre.currentIndex() else ""
+        if not query and self.reference is None and not genre:
             self.notice("Enter a movie or actor name, paste a YouTube URL, or add a reference image.")
             return
+        region = self.search_market.currentData()
+        target = self.search_language.currentData()
+        source = self.search_source.currentData() if not direct else ""
+        channels = self.search_mode.currentIndex() == 1 and not direct
+        self.begin_search(query, genre, region, target, source, channels)
+
+    def start_popular(self, channel):
+        self.begin_search("", "", self.search_region, self.search_target, "", False, channel)
+
+    def begin_search(self, query, genre, region, target, source, channels, channel=None):
         self.search_generation += 1
         self.search_pool.clear()
         self.image_pool.clear()
@@ -785,27 +892,49 @@ class Window(QMainWindow):
         self.rank.clear()
         self.next_token = None
         self.empty_pages = 0
-        self.search_args = (query, 40, "" if self.genre.currentIndex() == 0 else self.genre.currentText())
-        self.active_reference = self.reference
-        self.sort_label.setText("By visual similarity" if self.active_reference else "By views")
+        self.search_args = (query, genre, source)
+        if channel is None:
+            self.query.setToolTip("")
+        self.search_region, self.search_target = region, target
+        self.channel_results = channels
+        self.active_channel = channel
+        self.active_reference = self.reference if not (channels or channel) else None
+        self.sort_label.setText("By total channel views" if channels else
+                                "By visual similarity" if self.active_reference else "By views")
         self.sort_label.hide()
-        self.results_label.setText("Results")
+        self.back_to_channels.setVisible(channel is not None)
+        self.results_label.setText(self.search_title())
         self.fetch_page(None)
+
+    def search_title(self):
+        if self.active_channel:
+            return f"Popular · {self.active_channel.title[:36]}"
+        return "Channels" if self.channel_results else "Results"
 
     def fetch_page(self, token):
         self.searching = True
+        self.search_loading.show()
         self.more.hide()
         self.empty.setVisible(not self.results)
         self.empty.setText("Searching YouTube…")
-        self.notice("Searching YouTube…")
         generation = self.search_generation
-        client, args = self.youtube, self.search_args
-        self.task(lambda: client.page(*args, token=token),
-                  partial(self.page_ready, generation, token), self.search_pool)
+        client = self.youtube
+        query, genre, source = self.search_args
+        region, target, channels = self.search_region, self.search_target, self.channel_results
+        channel_id = self.active_channel.id if self.active_channel else ""
+
+        def fetch():
+            resolved = translate_query(query, source, target) if source else query
+            videos, next_token = client.page(resolved, 40, genre, token=token, region=region, language=target,
+                                            channel_id=channel_id, popular=channels)
+            return client.channels(videos) if channels else videos, next_token, resolved
+
+        self.task(fetch, partial(self.page_ready, generation, token), self.search_pool)
 
     def page_ready(self, generation, token, result, error):
         if generation != self.search_generation:
             return
+        self.search_loading.hide()
         self.searching = False
         if error:
             self.next_token = token
@@ -813,7 +942,11 @@ class Window(QMainWindow):
             self.empty.setText(error)
             self.notice(error)
             return
-        videos, next_token = result
+        videos, next_token, resolved = result
+        _, genre, source = self.search_args
+        if source:
+            self.search_args = (resolved, genre, "")
+            self.query.setToolTip(f"Search query: {resolved}" if resolved else "")
         self.next_token = next_token if next_token != token else None
         previous = len(self.results)
         for video in videos:
@@ -824,11 +957,13 @@ class Window(QMainWindow):
         self.arrange_cards()
         count = len(self.results)
         self.sort_label.setVisible(bool(count))
-        self.results_label.setText(f"Results  ·  {count:,}")
+        self.results_label.setText(f"{self.search_title()}  ·  {count:,}")
         self.empty.setVisible(not count)
-        self.empty.setText("No matching videos in the fetched results")
+        self.empty.setText("No matching channels in the fetched results" if self.channel_results else
+                           "No matching videos in the fetched results")
         self.more.setVisible(bool(self.next_token))
-        self.notice(f"{count:,} fetched result{'s' if count != 1 else ''}")
+        self.notice(f"Search query: {resolved}" if source and resolved else
+                    f"{count:,} fetched result{'s' if count != 1 else ''}")
         if count == previous and self.next_token and self.empty_pages < 2:
             self.empty_pages += 1
             QTimer.singleShot(0, self.load_more)
@@ -878,14 +1013,20 @@ class Window(QMainWindow):
         title.setMinimumHeight(35)
         title.setToolTip(video.title)
         layout.addWidget(title)
-        caption = label(f"{video.channel}  ·  {video.date}", "muted")
-        caption.setWordWrap(True)
-        layout.addWidget(caption)
-        layout.addWidget(label(f"{video.views:,} views", "muted"))
+        if not isinstance(video, Channel):
+            caption = label(f"{video.channel}  ·  {video.date}", "muted")
+            caption.setWordWrap(True)
+            layout.addWidget(caption)
+        layout.addWidget(label(f"{video.views:,} total views" if isinstance(video, Channel) else
+                               f"{video.views:,} views", "muted"))
         layout.addStretch()
-        actions = row(button("Save", partial(self.video_action, video, False), "", "save"),
-                      button("Watch", lambda: QDesktopServices.openUrl(QUrl(video.url)), "", "watch"),
-                      button("Edit", partial(self.video_action, video, True), "", "edit"))
+        if isinstance(video, Channel):
+            actions = row(button("Popular videos", partial(self.start_popular, video), "primary", "watch"),
+                          button("Open channel", lambda: QDesktopServices.openUrl(QUrl(video.url))))
+        else:
+            actions = row(button("Save", partial(self.video_action, video, False), "", "save"),
+                          button("Watch", lambda: QDesktopServices.openUrl(QUrl(video.url)), "", "watch"),
+                          button("Edit", partial(self.video_action, video, True), "", "edit"))
         for index in range(actions.count()):
             self.decorate(actions.itemAt(index).widget())
         layout.addLayout(actions)
@@ -1030,19 +1171,23 @@ class Window(QMainWindow):
         content.addWidget(left, 3)
 
         right = panel()
-        right.setMinimumWidth(360)
+        right.setMinimumWidth(380)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(10, 10, 10, 10)
         self.auto_button = button("Auto Adjust", self.auto_adjust, "primary", "create")
         self.auto_button.setMinimumWidth(108)
+        self.remove_button = button("Object Remover", self.toggle_remove)
+        self.remove_button.setCheckable(True)
+        self.remove_button.setMinimumWidth(124)
         self.remove_mode = QComboBox()
-        self.remove_mode.addItems(["Remove", "Rectangle", "Brush"])
+        self.remove_mode.addItems(["Rectangle", "Brush"])
         self.remove_mode.setAccessibleName("Object or text remover")
-        self.remove_mode.setMinimumWidth(112)
-        self.remove_mode.currentIndexChanged.connect(self.toggle_remove)
+        self.remove_mode.currentIndexChanged.connect(self.update_remove_mode)
+        self.remove_mode.hide()
         self.enhance_button = button("Enhance", self.enhance, "", "image")
-        self.enhance_button.setToolTip("Upscale this candidate to 1920 × 1080 using the optional local AI tools.")
-        right_layout.addLayout(row(self.auto_button, self.remove_mode, self.enhance_button))
+        self.enhance_button.setToolTip("Trim black borders and enhance this candidate to 1920 × 1080.")
+        right_layout.addLayout(row(self.auto_button, self.remove_button, self.enhance_button))
+        right_layout.addWidget(self.remove_mode)
         self.brush_width = QSpinBox()
         self.brush_width.setRange(1, 18)
         self.brush_width.setValue(4)
@@ -1137,7 +1282,7 @@ class Window(QMainWindow):
         self.active = slot
         self.clear_selection()
         self.before.setChecked(False)
-        self.remove_mode.setCurrentIndex(0)
+        self.close_remove()
         self.preview.set_data(None, "Rendering…" if self.candidates[slot].source else "Load an image to start editing")
         self.sync_editor()
 
@@ -1173,15 +1318,17 @@ class Window(QMainWindow):
         candidate = self.candidates[self.active]
         self.undo_button.setEnabled(bool(candidate.undo) or candidate.edit != self.draft)
         self.redo_button.setEnabled(bool(candidate.redo) and candidate.edit == self.draft)
-        self.remove_mode.setEnabled(bool(candidate.source) and not self.offline_busy)
-        self.enhance_button.setEnabled(bool(candidate.source) and not self.offline_busy and not self.draft.enhanced)
+        busy = self.offline_busy or self.auto_busy or self.downloading or getattr(self, "exporting", False)
+        self.auto_button.setEnabled(bool(candidate.source) and not busy)
+        self.remove_button.setEnabled(bool(candidate.source) and not busy)
+        self.remove_mode.setEnabled(not busy)
+        self.enhance_button.setEnabled(bool(candidate.source) and not busy and not self.draft.enhanced)
         self.enhance_button.setText("1080p ready" if self.draft.enhanced else "Enhance")
         self.download_button.setText(f"Download {'ABC'[self.active]}")
-        self.download_button.setEnabled(bool(candidate.source) and not self.downloading and not self.offline_busy)
+        self.download_button.setEnabled(bool(candidate.source) and not busy)
         for widget in (self.apply_remove, self.undo_mark, self.clear_marks):
-            widget.setEnabled(bool(self.remove_selections) and not self.offline_busy)
-        if not getattr(self, "exporting", False):
-            self.export_button.setEnabled(all(candidate.source for candidate in self.candidates))
+            widget.setEnabled(bool(self.remove_selections) and not busy)
+        self.export_button.setEnabled(not busy and all(candidate.source for candidate in self.candidates))
 
     def slider_change(self, name, value):
         self.control_fields[name][1].setText(str(value))
@@ -1224,7 +1371,10 @@ class Window(QMainWindow):
         self.commit()
         slot = self.active
         candidate = self.candidates[slot]
-        self.notice("Calculating adjustments…")
+        self.auto_busy = True
+        self.preview.selectable = False
+        self.update_actions()
+        self.preview.show_loading("Adjusting colors…")
         edit = candidate.edit
         def adjust():
             cropped = edit.repaired or studio.image_bytes(studio.crop_source(candidate.source, edit, (320, 180)))
@@ -1232,6 +1382,10 @@ class Window(QMainWindow):
         self.task(adjust, partial(self.auto_ready, slot, candidate, edit))
 
     def auto_ready(self, slot, candidate, edit, values, error):
+        self.auto_busy = False
+        self.preview.show_loading("")
+        self.update_remove_mode()
+        self.update_actions()
         if error:
             self.notice(error)
         else:
@@ -1247,28 +1401,38 @@ class Window(QMainWindow):
 
     def before_toggled(self, enabled):
         if enabled:
-            self.remove_mode.setCurrentIndex(0)
+            self.close_remove()
         self.queue_preview()
 
-    def toggle_remove(self, mode):
-        if mode != 0 and not offline.ready(self.model_root, "remove"):
-            self.remove_mode.setCurrentIndex(0)
+    def toggle_remove(self, enabled):
+        if enabled and not offline.ready(self.model_root, "remove"):
+            self.remove_button.setChecked(False)
             slot = self.active
             candidate = self.candidates[slot]
-            self.prepare_tool("remove", lambda: self.remove_mode.setCurrentIndex(mode)
+            self.prepare_tool("remove", lambda: self.toggle_remove(True)
                               if self.active == slot and self.candidates[slot] is candidate else None)
             return
-        enabled = mode != 0
-        self.preview.selectable = enabled
-        self.preview.selection_mode = "brush" if mode == 2 else "box"
-        self.brush_width.setVisible(mode == 2)
-        self.remove_actions.setVisible(enabled)
-        self.preview.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        self.remove_button.setChecked(enabled)
         if enabled:
+            self.remove_mode.setCurrentIndex(0)
             self.before.setChecked(False)
-            self.notice("Mark the object or text, then select Apply removal.")
         else:
             self.clear_selection()
+        self.update_remove_mode()
+
+    def close_remove(self):
+        if self.remove_button.isChecked():
+            self.toggle_remove(False)
+
+    def update_remove_mode(self):
+        enabled = self.remove_button.isChecked()
+        brush = self.remove_mode.currentIndex() == 1
+        self.preview.selectable = enabled and not self.offline_busy and not self.auto_busy
+        self.preview.selection_mode = "brush" if brush else "box"
+        self.remove_mode.setVisible(enabled)
+        self.brush_width.setVisible(enabled and brush)
+        self.remove_actions.setVisible(enabled)
+        self.preview.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
 
     def change_brush_width(self, value):
         self.preview.brush = value / 100
@@ -1298,12 +1462,13 @@ class Window(QMainWindow):
         if message.clickedButton() is not accept:
             return
         self.offline_busy = True
-        self.remove_mode.setCurrentIndex(0)
+        self.close_remove()
         self.update_actions()
-        self.notice(f"Setting up {model.label}…")
+        self.preview.show_loading("Preparing offline AI…")
 
         def finished(_, error):
             self.offline_busy = False
+            self.preview.show_loading("")
             self.update_actions()
             self.notice(error or f"{model.label} is ready.")
             if not error:
@@ -1354,13 +1519,15 @@ class Window(QMainWindow):
         edit = candidate.edit
         self.offline_busy = True
         if not selection:
-            self.remove_mode.setCurrentIndex(0)
+            self.close_remove()
         self.preview.selectable = False
         self.update_actions()
-        self.notice("Rebuilding the selected area with LaMa…" if selection else "Enhancing to 1920 × 1080…")
+        self.preview.show_loading("Removing object…" if selection else "Enhancing thumbnail…")
 
         def process():
-            if edit.repaired:
+            if not selection:
+                image = studio.enhancement_input(candidate.source, edit)
+            elif edit.repaired:
                 image = studio.open_image(edit.repaired)
             else:
                 image = studio.crop_source(candidate.source, edit, studio.SIZE)
@@ -1370,8 +1537,9 @@ class Window(QMainWindow):
 
     def offline_ready(self, slot, candidate, edit, removal, data, error):
         self.offline_busy = False
+        self.preview.show_loading("")
         self.commit()
-        self.preview.selectable = self.remove_mode.currentIndex() != 0
+        self.update_remove_mode()
         if error:
             self.notice(error)
         elif self.candidates[slot] is candidate and (candidate.edit.crop, candidate.edit.vertical, candidate.edit.zoom,
@@ -1386,6 +1554,15 @@ class Window(QMainWindow):
             self.notice("Selection rebuilt." if removal else "Enhanced to 1920 × 1080.")
         else:
             self.notice("The candidate changed while the AI job was running. Run the tool again.")
+
+    def show_edit_progress(self, text):
+        if not self.offline_busy:
+            return
+        match = re.search(r" (\d+)%$", text)
+        if text.startswith("Downloading"):
+            self.preview.show_loading("Downloading model…", int(match[1]) if match else None)
+        elif text.startswith("Installing"):
+            self.preview.show_loading("Preparing offline AI…")
 
     def download_candidate(self):
         self.commit()
@@ -1406,10 +1583,11 @@ class Window(QMainWindow):
         self.settings.setValue("exports", str(path.parent))
         self.downloading = True
         self.update_actions()
-        self.notice(f"Saving candidate {letter}…")
+        self.preview.show_loading("Saving thumbnail…")
 
         def finished(size, error):
             self.downloading = False
+            self.preview.show_loading("")
             self.update_actions()
             self.notice(error or f"Saved {path.name} · {size[0]} × {size[1]}")
 
@@ -1474,12 +1652,13 @@ class Window(QMainWindow):
             snapshot = [studio.Candidate(candidate.source, candidate.filename, candidate.edit) for candidate in self.candidates]
             movie = self.movie.text()
             self.exporting = True
-            self.export_button.setEnabled(False)
-            self.notice("Exporting three JPGs…")
+            self.update_actions()
+            self.preview.show_loading("Exporting thumbnails…")
             self.task(lambda: studio.export(snapshot, folder, movie), self.export_ready)
 
     def export_ready(self, path, error):
         self.exporting = False
+        self.preview.show_loading("")
         self.update_actions()
         if error:
             self.notice(error)
@@ -1510,6 +1689,8 @@ class Window(QMainWindow):
         token.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow("Cloudflare account ID", account)
         form.addRow("Workers AI token", token)
+        models = button("Manage downloads", partial(self.open_model_downloads, dialog))
+        form.addRow("Offline AI models", models)
         actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         def save():
             try:
@@ -1541,37 +1722,117 @@ class Window(QMainWindow):
             self.apply_theme()
             self.notice("Settings saved")
 
+    def open_model_downloads(self, parent):
+        dialog = QDialog(parent, windowTitle="Offline AI models")
+        dialog.setMinimumWidth(435)
+        layout = QFormLayout(dialog)
+        status = label("", "muted")
+        status.setWordWrap(True)
+
+        def refresh():
+            for tool, (state, delete) in fields.items():
+                path = offline.model_path(self.model_root, tool)
+                if path.is_file():
+                    state.setText(f"{path.stat().st_size / 1_000_000:.0f} MB downloaded")
+                    delete.setEnabled(not self.offline_busy)
+                else:
+                    state.setText("Not downloaded")
+                    delete.setEnabled(False)
+
+        def delete_model(tool):
+            if self.offline_busy:
+                return
+            model = offline.MODELS[tool]
+            answer = QMessageBox.question(dialog, f"Delete {model.label}?",
+                                          "Thumb Finder will offer to download it again when needed.",
+                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                                          QMessageBox.StandardButton.Cancel)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                offline.delete_model(self.model_root, tool)
+            except OSError:
+                status.setText(f"Could not delete {model.label}.")
+            else:
+                if tool == "remove":
+                    self.close_remove()
+                status.setText(f"Deleted {model.label}.")
+            refresh()
+
+        fields = {}
+        for tool, model in offline.MODELS.items():
+            state = label("", "muted")
+            delete = button("Delete", partial(delete_model, tool))
+            delete.setAccessibleName(f"Delete {model.label}")
+            fields[tool] = (state, delete)
+            layout.addRow(model.label, row(state, delete))
+        layout.addRow(status)
+        if self.offline_busy:
+            status.setText("Finish the current AI job before deleting a model.")
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(dialog.reject)
+        layout.addRow(close)
+        refresh()
+        dialog.exec()
+
     def check_updates(self):
+        self.update_button.setEnabled(False)
         self.notice("Checking for updates…")
+        self.task(lambda: updater.check(REPOSITORY, BUILD), self.updates_ready)
 
-        def check():
-            url = REPOSITORY.replace("github.com", "api.github.com/repos") + "/releases/latest"
-            response = requests.get(url, timeout=(4, 8))
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            return response.json().get("tag_name", "").lstrip("v")
-
-        self.task(check, self.updates_ready)
-
-    def updates_ready(self, version, error):
+    def updates_ready(self, release, error):
+        self.update_button.setEnabled(True)
+        installed = updater.installed_bundle()
         if error:
             text = "The update check could not reach GitHub."
-        elif not version:
-            text = "GitHub did not return a published release."
+        elif release is None:
+            text = f"No newer public release was found for Thumb Finder v{VERSION}."
+        elif not release.url:
+            text = "A new Thumb Finder build is available. Its verified Mac ZIP is missing."
+        elif not installed:
+            text = "A new build is available. In-app updates require the Mac app in Applications."
         else:
-            def parts(value):
-                import re
-                numbers = tuple(map(int, re.findall(r"\d+", value.split("-")[0])[:3]))
-                return (numbers + (0, 0, 0))[:3]
-            text = f"Thumb Finder {version} is available." if parts(version) > parts(VERSION) else f"You are using Thumb Finder v{VERSION}."
+            text = f"A new Thumb Finder v{VERSION} build is available ({release.size / (1024 * 1024):.0f} MB)."
         self.notice(text)
         message = QMessageBox(QMessageBox.Icon.Information, "Check for updates", text, parent=self)
+        install = None
+        if release and release.url and installed:
+            install = message.addButton("Download update", QMessageBox.ButtonRole.AcceptRole)
         releases = message.addButton("Open GitHub Releases", QMessageBox.ButtonRole.ActionRole)
         message.addButton(QMessageBox.StandardButton.Close)
         message.exec()
         if message.clickedButton() is releases:
             QDesktopServices.openUrl(QUrl(REPOSITORY + "/releases"))
+        elif install is not None and message.clickedButton() is install:
+            self.update_button.setEnabled(False)
+            self.notice("Downloading and verifying the Thumb Finder update…")
+            self.task(lambda: updater.prepare(release, installed), partial(self.update_prepared, installed))
+
+    def update_prepared(self, installed, stage, error):
+        self.update_button.setEnabled(True)
+        if error:
+            self.notice(error)
+            QMessageBox.warning(self, "Update could not be prepared",
+                                f"{error}\n\nYou can install the ZIP from GitHub Releases manually.")
+            return
+        if self.offline_busy or not self.generate_button.isEnabled() or self.downloading or getattr(self, "exporting", False):
+            shutil.rmtree(stage)
+            self.notice("Finish the current edit, generation, or export before installing the update.")
+            return
+        answer = QMessageBox.question(self, "Install and restart",
+                                      "Install the update and restart? Download or export any unsaved edits first.",
+                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                                      QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            shutil.rmtree(stage)
+            return
+        try:
+            self.settings.sync()
+            updater.restart(stage, installed)
+        except OSError as error:
+            self.notice(f"Could not start the updater: {error}")
+        else:
+            QApplication.instance().quit()
 
     def closeEvent(self, event):
         self.create_stop.set()

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 thumb_finder/_build_keys.py
+thumb_finder/build_version.txt
 build/
 dist/
 *.spec

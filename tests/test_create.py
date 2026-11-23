@@ -56,8 +56,17 @@ class CreateTests(TestCase):
     def test_cloud_generation_decodes_api_image(self, post):
         data = studio.image_bytes(Image.new("RGB", (40, 30), "purple"))
         post.return_value = response({"result": {"image": b64encode(data).decode()}})
-        self.assertEqual(services.cloud_image("a" * 32, "token", "Action scene"), data)
-        self.assertEqual(post.call_args.kwargs["json"], {"prompt": "Action scene", "steps": 4})
+        post.return_value.headers = {"Content-Type": "application/json"}
+        self.assertEqual(services.cloud_image("a" * 32, "token", "Action scene", [("source", data)]), data)
+        fields = post.call_args.kwargs["files"]
+        self.assertEqual(fields["prompt"], (None, "Action scene Attached image 1 is the source."))
+        self.assertEqual(fields["width"], (None, "512"))
+        self.assertEqual(fields["height"], (None, "288"))
+        self.assertEqual(fields["input_image_0"], ("reference-1.png", data, "image/png"))
+        self.assertTrue(post.call_args.args[0].endswith("/flux-2-klein-4b"))
+        self.assertEqual(services.cloud_image("a" * 32, "token", "Action scene", model="9b"), data)
+        self.assertTrue(post.call_args.args[0].endswith("/flux-2-klein-9b"))
+        self.assertEqual(post.call_args.kwargs["files"]["width"], (None, "1024"))
 
     def test_rectangular_and_brush_masks_keep_marked_pixels_only(self):
         for selection in (

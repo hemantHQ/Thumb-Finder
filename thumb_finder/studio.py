@@ -90,13 +90,66 @@ def render(source, edit, size=SIZE, original=False):
 
 
 def crop_source(source, edit, size):
-    image = open_image(source)
+    return crop_image(open_image(source), edit, size)
+
+
+def crop_image(image, edit, size):
     width, height = image.size
     factor = min(width / size[0], height / size[1]) * 100 / edit.zoom
     crop_width, crop_height = size[0] * factor, size[1] * factor
     left = (width - crop_width) * edit.crop / 100
     top = (height - crop_height) * edit.vertical / 100
     return image.resize(size, Image.Resampling.LANCZOS, box=(left, top, left + crop_width, top + crop_height))
+
+
+def trim_black_borders(image):
+    probe = image.convert("L")
+    probe.thumbnail((480, 480), Image.Resampling.BOX)
+    width, height = probe.size
+    if min(width, height) < 32:
+        return image
+    pixels = probe.tobytes()
+
+    def band(edge, length, line, coverage):
+        minimum = max(2, round(length * 0.01))
+        limit = round(length * 0.21)
+        depth = 0
+        for index in range(limit + 1):
+            values = line(edge(index))
+            if sum(value <= 16 for value in values) < len(values) * coverage:
+                break
+            depth += 1
+        if not minimum <= depth <= limit:
+            return 0
+        interior = line(edge(min(length - 1, depth + 3)))
+        return depth if sum(value > 30 for value in interior) >= len(interior) * 0.18 else 0
+
+    x_margin = width // 12
+
+    def row(y):
+        return pixels[y * width + x_margin:(y + 1) * width - x_margin]
+
+    top = band(lambda index: index, height, row, 0.98)
+    bottom = band(lambda index: height - 1 - index, height, row, 0.98)
+    y_margin = max(1, (height - top - bottom) // 12)
+
+    def column(x):
+        return pixels[(top + y_margin) * width + x:(height - bottom - y_margin) * width + x:width]
+
+    left = band(lambda index: index, width, column, 0.98)
+    right = band(lambda index: width - 1 - index, width, column, 0.98)
+    if not any((top, bottom, left, right)):
+        return image
+    return image.crop((round(left * image.width / width), round(top * image.height / height),
+                       image.width - round(right * image.width / width),
+                       image.height - round(bottom * image.height / height)))
+
+
+def enhancement_input(source, edit):
+    if edit.repaired:
+        image = trim_black_borders(open_image(edit.repaired))
+        return crop_image(image, Edit(), SIZE)
+    return crop_image(trim_black_borders(open_image(source)), edit, SIZE)
 
 
 def apply_adjustments(image, edit, size):

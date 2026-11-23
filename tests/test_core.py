@@ -6,10 +6,32 @@ from unittest.mock import Mock, patch
 from PIL import Image
 
 from thumb_finder import studio
-from thumb_finder.youtube import Video, YouTube, distance, duration, signature, thumbnail, video_id
+from thumb_finder.youtube import Video, YouTube, distance, duration, signature, thumbnail, translate_query, video_id
 
 
 class SearchTests(TestCase):
+    @patch("thumb_finder.youtube.requests.get")
+    def test_query_translation_uses_brazilian_portuguese(self, get):
+        get.return_value.json.return_value = {"responseStatus": 200, "responseData": {"translatedText": "filme de ação"}}
+        self.assertEqual(translate_query("action movie", "en"), "filme de ação")
+        self.assertEqual(get.call_args.kwargs["params"]["langpair"], "en|pt-BR")
+
+    def test_argentina_search_orders_popular_channel_uploads_by_views(self):
+        client = YouTube(["test"])
+        with patch.object(client, "request", return_value={"items": []}) as request:
+            client.page("aventura", 40, "Action", region="AR", language="pt-BR", popular=True)
+            self.assertEqual(request.call_args.kwargs["q"], "aventura ação filme completo")
+            self.assertEqual(request.call_args.kwargs["regionCode"], "AR")
+            self.assertEqual(request.call_args.kwargs["relevanceLanguage"], "pt")
+            self.assertEqual(request.call_args.kwargs["order"], "viewCount")
+            client.page("", 40, "", channel_id="movie-channel", region="AR", language="pt-BR")
+            self.assertEqual(request.call_args.kwargs["channelId"], "movie-channel")
+            self.assertEqual(request.call_args.kwargs["order"], "viewCount")
+            self.assertNotIn("q", request.call_args.kwargs)
+            client.page("aventura", 40, "Action", region="ES", language="es")
+            self.assertEqual(request.call_args.kwargs["q"], "aventura acción película completa")
+            self.assertEqual(request.call_args.kwargs["regionCode"], "ES")
+
     def test_video_url_and_duration(self):
         expected = "dQw4w9WgXcQ"
         for link in (f"youtu.be/{expected}", f"https://www.youtube.com/watch?v={expected}",
@@ -53,6 +75,18 @@ class SearchTests(TestCase):
 
 
 class StudioTests(TestCase):
+    def test_enhance_trims_borders_and_keeps_dark_frames(self):
+        image = Image.new("RGB", (640, 360), "black")
+        image.paste((181, 130, 76), (46, 28, 594, 332))
+        trimmed = studio.trim_black_borders(image)
+        self.assertLess(trimmed.width, 570)
+        self.assertLess(trimmed.height, 320)
+        self.assertEqual(trimmed.getpixel((trimmed.width // 2, 3)), (181, 130, 76))
+        dark = Image.new("RGB", (640, 360), (8, 9, 10))
+        self.assertEqual(studio.trim_black_borders(dark).size, dark.size)
+        enhanced_input = studio.enhancement_input(studio.image_bytes(image), studio.Edit())
+        self.assertEqual(enhanced_input.size, (1280, 720))
+        self.assertGreater(enhanced_input.getpixel((640, 6))[0], 100)
     def test_independent_candidates_and_repeated_export(self):
         sources = [studio.image_bytes(Image.new("RGB", (550, 850), color))
                    for color in ("red", "green", "blue")]

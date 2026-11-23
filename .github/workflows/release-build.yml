@@ -8,20 +8,30 @@ on:
         type: boolean
         default: true
   push:
-    tags: ['v1.0']
+    branches: ['**']
 
 permissions:
   contents: read
 
 jobs:
   macos-arm64:
+    if: github.event_name == 'workflow_dispatch' || github.ref_name == github.event.repository.default_branch
     runs-on: macos-15
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           architecture: arm64
+      - name: Set build version
+        id: release
+        shell: bash
+        run: |
+          tag="v1.0-build-$GITHUB_RUN_NUMBER"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$GITHUB_RUN_NUMBER" > thumb_finder/build_version.txt
       - name: Install and test
         env:
           QT_QPA_PLATFORM: offscreen
@@ -46,6 +56,7 @@ jobs:
       - name: Package
         env:
           QT_QPA_PLATFORM: offscreen
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           mkdir -p build/AppIcon.iconset
           python - <<'PY'
@@ -68,13 +79,17 @@ jobs:
                   assert image.save(f"build/AppIcon.iconset/icon_{size}x{size}{suffix}.png")
           PY
           iconutil -c icns build/AppIcon.iconset -o build/AppIcon.icns
-          python -m PyInstaller --noconfirm --windowed --name "Thumb Finder" --icon build/AppIcon.icns --add-data "thumb_finder/app_icon.svg:thumb_finder" --add-data "thumb_finder/chevron.svg:thumb_finder" --add-data "thumb_finder/offline_worker.py:thumb_finder" --target-arch arm64 --osx-bundle-identifier com.thumbfinder.app run_app.py
-          ditto -c -k --keepParent "dist/Thumb Finder.app" "dist/Thumb-Finder-v1.0-macOS-arm64.zip"
-          unzip -t "dist/Thumb-Finder-v1.0-macOS-arm64.zip"
+          python -m PyInstaller --noconfirm --windowed --name "Thumb Finder" --icon build/AppIcon.icns --add-data "thumb_finder/app_icon.svg:thumb_finder" --add-data "thumb_finder/chevron.svg:thumb_finder" --add-data "thumb_finder/offline_worker.py:thumb_finder" --add-data "thumb_finder/build_version.txt:thumb_finder" --target-arch arm64 --osx-bundle-identifier com.thumbfinder.app run_app.py
+          ditto -c -k --keepParent "dist/Thumb Finder.app" "dist/Thumb-Finder-$RELEASE_TAG-macOS-arm64.zip"
+          unzip -t "dist/Thumb-Finder-$RELEASE_TAG-macOS-arm64.zip"
       - name: Verify signature, icon, and launch from the release ZIP
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           verify_dir="$(mktemp -d)"
-          ditto -x -k "dist/Thumb-Finder-v1.0-macOS-arm64.zip" "$verify_dir"
+          archive="dist/Thumb-Finder-$RELEASE_TAG-macOS-arm64.zip"
+          python -c 'import sys; from thumb_finder.updater import check_archive; check_archive(sys.argv[1])' "$archive"
+          ditto -x -k "$archive" "$verify_dir"
           bundle="$verify_dir/Thumb Finder.app"
           executable="$bundle/Contents/MacOS/Thumb Finder"
           lipo "$executable" -verify_arch arm64
@@ -85,12 +100,13 @@ jobs:
           import plistlib
           import subprocess
           import sys
+          from thumb_finder.updater import verify_bundle
 
           bundle, executable, verify_dir = map(Path, sys.argv[1:])
+          verify_bundle(bundle, os.environ["RELEASE_TAG"])
           contents = bundle / "Contents"
           with (contents / "Info.plist").open("rb") as file:
               info = plistlib.load(file)
-          assert info["CFBundleIdentifier"] == "com.thumbfinder.app"
           icon = contents / "Resources" / info["CFBundleIconFile"]
           if not icon.suffix:
               icon = icon.with_suffix(".icns")
@@ -104,17 +120,17 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: Thumb-Finder-v1.0-macOS-arm64
-          path: dist/Thumb-Finder-v1.0-macOS-arm64.zip
+          name: Thumb-Finder-${{ steps.release.outputs.tag }}-macOS-arm64
+          path: dist/Thumb-Finder-${{ steps.release.outputs.tag }}-macOS-arm64.zip
           if-no-files-found: error
 
   publish:
     name: Publish macOS ZIP to Releases
     needs: macos-arm64
     if: >-
-      github.event_name == 'push' ||
-      (inputs.publish_release && github.ref_type == 'branch' &&
-       github.ref_name == github.event.repository.default_branch)
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name == 'push' || inputs.publish_release)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -128,16 +144,22 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: Thumb-Finder-v1.0-macOS-arm64
+          name: Thumb-Finder-${{ needs.macos-arm64.outputs.tag }}-macOS-arm64
           path: release
       - name: Publish verified asset
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.macos-arm64.outputs.tag }}
         shell: bash
         run: |
-          tag=v1.0
-          zip=release/Thumb-Finder-v1.0-macOS-arm64.zip
+          tag="$RELEASE_TAG"
+          zip="release/Thumb-Finder-$tag-macOS-arm64.zip"
           test -s "$zip"
+          latest="$(gh release list --limit 25 --exclude-drafts --exclude-pre-releases --json isLatest,tagName --jq '.[] | select(.isLatest) | .tagName')"
+          if [[ "$latest" =~ ^v1\.0-build-([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] > GITHUB_RUN_NUMBER )); then
+            echo "A newer build is already published."
+            exit 0
+          fi
           commit="$(git rev-parse HEAD)"
           if tagged="$(git rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null)"; then
             if [[ "$tagged" != "$commit" ]]; then
@@ -160,6 +182,7 @@ jobs:
             fi
           else
             gh release create "$tag" "$zip" "${target[@]}" \
+              --latest \
               --title "Thumb Finder v1.0 — macOS Apple Silicon" \
-              --notes "Apple Silicon (arm64) build for Mac mini M4 and M6. This build is ad-hoc signed and unnotarized. Configure your YouTube and Cloudflare credentials in Thumb Finder Settings."
+              --notes "Build $GITHUB_RUN_NUMBER for Apple Silicon (arm64), including Mac mini M4 and M6. This build is ad-hoc signed and unnotarized. Configure your keys in Thumb Finder Settings."
           fi

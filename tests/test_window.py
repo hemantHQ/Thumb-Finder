@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from thumb_finder.app import Window
 from thumb_finder.studio import image_bytes
-from thumb_finder.youtube import Video, YouTube
+from thumb_finder.youtube import Channel, Video, YouTube
 
 
 class WindowTests(TestCase):
@@ -72,17 +72,24 @@ class WindowTests(TestCase):
         self.assertNotEqual(self.window.dark, previous)
 
     def test_create_renders_draft_and_sends_it_to_editor(self):
+        from pathlib import Path
+
         self.window.show_page(1)
         self.assertFalse(self.window.windowIcon().pixmap(42, 42).isNull())
         self.window.generate_images()
         self.assertIn("Enter a prompt", self.window.create_status.text())
         self.window.create_prompt.setPlainText("A tense movie scene")
         data = image_bytes(Image.new("RGB", (360, 220), "purple"))
+        source = Path(self.directory.name) / "reference.png"
+        source.write_bytes(data)
+        self.assertFalse(self.window.create_reference_buttons[0].isHidden())
+        self.window.set_create_reference(0, str(source))
         with patch("thumb_finder.services.cloud_image", return_value=data) as generate:
             self.window.generate_images()
             self.wait_for(lambda: len(self.window.create_outputs) == 1)
             self.wait_for(self.window.generate_button.isEnabled)
         self.assertIn("A tense movie scene", generate.call_args.args[2])
+        self.assertEqual(generate.call_args.args[3][0][0], "source image to edit")
         self.assertEqual(self.window.create_history.count(), 2)
         self.assertFalse(self.window.draft_images[0].pixmap.isNull())
         self.window.create_history.setCurrentIndex(0)
@@ -93,6 +100,30 @@ class WindowTests(TestCase):
         self.assertEqual(self.window.pages.currentIndex(), 2)
         self.assertEqual(self.window.candidates[0].source, data)
         self.wait_for(lambda: not self.window.preview.pixmap.isNull())
+
+    def test_argentina_channel_search_opens_popular_videos(self):
+        data = image_bytes(Image.new("RGB", (360, 220), "purple"))
+        channel = Channel("channel-id", "Cinema", 600, {})
+        video = Video("video-id", "A movie", "Cinema", 50, "2026-01-01", 3600, {}, channel.id)
+        self.window.youtube = YouTube(["mock"])
+        self.window.search_market.setCurrentIndex(self.window.search_market.findData("AR"))
+        self.window.search_language.setCurrentIndex(self.window.search_language.findData("pt-BR"))
+        self.window.search_source.setCurrentIndex(self.window.search_source.findData("en"))
+        self.window.search_mode.setCurrentIndex(1)
+        self.window.query.setText("action movie")
+        with patch.object(YouTube, "page", return_value=([video], None)) as page, \
+                patch.object(YouTube, "channels", return_value=[channel]), \
+                patch("thumb_finder.app.translate_query", return_value="filme de ação"), \
+                patch("thumb_finder.app.thumbnail", return_value=data):
+            self.window.start_search()
+            self.wait_for(lambda: channel.id in self.window.cards)
+            self.assertEqual(page.call_args.args[0], "filme de ação")
+            actions = self.window.cards[channel.id].layout()
+            actions.itemAt(actions.count() - 1).layout().itemAt(0).widget().click()
+            self.wait_for(lambda: video.id in self.window.cards)
+            self.assertEqual(page.call_args.kwargs["channel_id"], channel.id)
+            self.assertEqual(page.call_args.kwargs["region"], "AR")
+            self.assertEqual(page.call_args.kwargs["language"], "pt-BR")
 
     def test_create_keeps_finished_draft_when_a_later_request_fails(self):
         self.window.show_page(1)
@@ -162,14 +193,16 @@ class WindowTests(TestCase):
 
         with patch("thumb_finder.offline.install", side_effect=install) as setup:
             QTimer.singleShot(0, lambda: answer("Cancel"))
-            self.window.remove_mode.setCurrentIndex(1)
+            self.window.remove_button.click()
             setup.assert_not_called()
-            self.assertEqual(self.window.remove_mode.currentIndex(), 0)
+            self.assertTrue(self.window.remove_mode.isHidden())
             QTimer.singleShot(0, lambda: answer("Download"))
-            self.window.remove_mode.setCurrentIndex(2)
+            self.window.remove_button.click()
             self.wait_for(lambda: self.window.preview.selectable)
-            self.assertEqual(self.window.preview.selection_mode, "brush")
+            self.assertEqual(self.window.remove_mode.currentText(), "Rectangle")
+            self.assertFalse(self.window.remove_mode.isHidden())
             self.window.remove_mode.setCurrentIndex(1)
+            self.assertEqual(self.window.preview.selection_mode, "brush")
             self.assertEqual(setup.call_count, 1)
 
     def test_download_is_available_for_one_candidate(self):

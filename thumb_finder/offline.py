@@ -41,6 +41,10 @@ def model_path(root, tool):
     return root / f"{tool}-{MODELS[tool].digest[:12]}.onnx"
 
 
+def delete_model(root, tool):
+    model_path(root, tool).unlink(missing_ok=True)
+
+
 def ready(root, tool):
     return (root / RUNTIME / ".ready").is_file() and model_path(root, tool).is_file()
 

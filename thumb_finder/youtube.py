@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
+from html import unescape
 import re
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -22,10 +23,55 @@ class Video:
     date: str
     seconds: int
     thumbnails: dict
+    channel_id: str = ""
 
     @property
     def url(self):
         return f"https://www.youtube.com/watch?v={self.id}"
+
+
+@dataclass(frozen=True)
+class Channel:
+    id: str
+    title: str
+    views: int
+    thumbnails: dict
+
+    @property
+    def url(self):
+        return f"https://www.youtube.com/channel/{self.id}/videos"
+
+
+PT_CATEGORIES = {
+    "Action": "ação", "Comedy": "comédia", "Drama": "drama", "Horror": "terror",
+    "Romance": "romance", "Thriller": "suspense", "Western": "faroeste",
+}
+ES_CATEGORIES = {
+    "Action": "acción", "Comedy": "comedia", "Drama": "drama", "Horror": "terror",
+    "Romance": "romance", "Thriller": "suspenso", "Western": "película del oeste",
+}
+LANGUAGES = (("English", "en"), ("Portuguese (Brazil)", "pt-BR"), ("Spanish", "es"))
+REGIONS = (("Default region", ""), ("Brazil", "BR"), ("Spain", "ES"), ("Argentina", "AR"),
+           ("Mexico", "MX"), ("United States", "US"), ("United Kingdom", "GB"), ("Colombia", "CO"),
+           ("Chile", "CL"), ("Portugal", "PT"), ("Canada", "CA"), ("India", "IN"))
+
+
+def translate_query(query, source, target="pt-BR"):
+    if not query or not source or source == target:
+        return query
+    if len(query.encode("utf-8")) > 500:
+        raise ValueError("Use a shorter query for translation.")
+    try:
+        response = requests.get("https://api.mymemory.translated.net/get",
+                                params={"q": query, "langpair": f"{source}|{target}"}, timeout=(4, 10))
+        response.raise_for_status()
+        body = response.json()
+        translated = body.get("responseData", {}).get("translatedText", "")
+        if str(body.get("responseStatus")) == "200" and translated.strip():
+            return unescape(translated).strip()
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        pass
+    raise ValueError("Translation is unavailable. Type the query in the target language and choose As typed.")
 
 
 def video_id(text):
@@ -99,13 +145,24 @@ class YouTube:
             raise ValueError(f"YouTube rejected the request (HTTP {response.status_code}). Check your key restrictions.")
         raise ValueError(errors[0] if errors else "The configured YouTube keys have exhausted their quota. Try again after the quota resets.")
 
-    def page(self, query, minutes, genre, token=None):
+    def page(self, query, minutes, genre, token=None, region="", language="en",
+             channel_id="", popular=False):
         direct = video_id(query)
         if direct:
             ids, next_token = [direct], None
         else:
-            params = dict(part="snippet", type="video", maxResults=24,
-                          q=" ".join(filter(None, (query, genre, "full movie"))))
+            params = dict(part="snippet", type="video", maxResults=24)
+            if channel_id:
+                params["channelId"] = channel_id
+            else:
+                categories = {"pt-BR": PT_CATEGORIES, "es": ES_CATEGORIES}.get(language, {})
+                phrase = {"pt-BR": "filme completo", "es": "película completa"}.get(language, "full movie")
+                params["q"] = " ".join(filter(None, (query, categories.get(genre, genre), phrase)))
+            if region:
+                params["regionCode"] = region
+            params["relevanceLanguage"] = language.split("-")[0]
+            if popular or channel_id:
+                params["order"] = "viewCount"
             if minutes >= 20:
                 params["videoDuration"] = "long"
             if token:
@@ -123,8 +180,18 @@ class YouTube:
             if direct or seconds >= minutes * 60:
                 videos.append(Video(row["id"], snippet["title"], snippet.get("channelTitle", ""),
                                     int(row.get("statistics", {}).get("viewCount", 0)),
-                                    snippet.get("publishedAt", "")[:10], seconds, snippet["thumbnails"]))
+                                    snippet.get("publishedAt", "")[:10], seconds, snippet["thumbnails"],
+                                    snippet.get("channelId", "")))
         return videos, next_token
+
+    def channels(self, videos):
+        ids = tuple(dict.fromkeys(video.channel_id for video in videos if video.channel_id))
+        if not ids:
+            return []
+        result = self.request("channels", part="snippet,statistics", id=",".join(ids))
+        return [Channel(item["id"], item["snippet"]["title"],
+                        int(item.get("statistics", {}).get("viewCount", 0)),
+                        item["snippet"].get("thumbnails", {})) for item in result.get("items", [])]
 
 
 def thumbnail(video, preview=False):
